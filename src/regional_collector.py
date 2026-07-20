@@ -15,6 +15,13 @@ from .models import AuditRow, SourceInfo
 from .source_parser import parse_source_text
 from .url_utils import analyze_url_structure, infer_external_url, normalize_url, resolve_url_reference
 from .regions import REGION_DISPLAY_ORDER, validate_site_regions
+from .application.progress import (
+    AuditCancelled,
+    CancellationToken,
+    NeverCancelToken,
+    NullProgressReporter,
+    ProgressReporter,
+)
 
 
 class RegionalCollector:
@@ -22,7 +29,8 @@ class RegionalCollector:
         self, *, start_date: date, end_date: date, regions: list[str] | None,
         headed: bool, max_issues: int | None, timeout_ms: int, retries: int,
         link_delay_ms: int, checkpoint: CheckpointStore, logger,
-        debug: bool = False,
+        debug: bool = False, progress_reporter: ProgressReporter | None = None,
+        cancellation_token: CancellationToken | None = None,
     ):
         self.start_date = start_date
         self.end_date = end_date
@@ -35,8 +43,17 @@ class RegionalCollector:
         self.checkpoint = checkpoint
         self.logger = logger
         self.debug = debug
+        self.progress_reporter = progress_reporter or NullProgressReporter()
+        self.cancellation_token = cancellation_token or NeverCancelToken()
         self.issue_keys: set[tuple[str, str, int]] = set()
         self.completed_region_names: set[str] = set()
+        self.had_partial_failures = False
+        existing_rows = list(getattr(checkpoint, "rows", []))
+        self.known_links = len(existing_rows)
+        self.processed_links = len(existing_rows)
+        self.normal_count = sum(row.verdict == "정상" for row in existing_rows)
+        self.error_count = self.processed_links - self.normal_count
+        self.completed_region_units = 0
         self.status_by_page: dict[Page, int] = {}
         self.status_by_url: dict[str, int] = {}
         self.first_url_by_page: dict[Page, str] = {}
@@ -55,24 +72,66 @@ class RegionalCollector:
                 selected_regions = self._select_requested_regions(region_names)
                 navigator = DateNavigator(page, self.timeout_ms)
                 checker = BrowserLinkChecker(self.timeout_ms, self.retries)
-                for requested in inclusive_dates(self.start_date, self.end_date):
+                requested_dates = list(inclusive_dates(self.start_date, self.end_date))
+                total_region_units = len(requested_dates) * len(selected_regions)
+                self.progress_reporter.emit(
+                    "audit_started", "링크 점검을 시작합니다.",
+                    total_regions=len(selected_regions),
+                    total_region_units=total_region_units,
+                    processed_links=self.processed_links,
+                    normal_count=self.normal_count,
+                    error_count=self.error_count,
+                )
+                for requested in requested_dates:
+                    self._raise_if_cancelled()
+                    self.progress_reporter.emit(
+                        "date_started", f"{requested.isoformat()} 점검을 시작합니다.",
+                        current_date=requested.isoformat(),
+                    )
                     ok, displayed = await navigator.move_to(requested, retries=1)
                     if not ok:
+                        self.had_partial_failures = True
                         self._debug("날짜이동", requested, displayed, event="화면표시일 불일치", details=f"요청 {requested}, 화면 {displayed}")
                         self.logger.warning("[%s] 화면표시일 불일치로 건너뜁니다: %s", requested, displayed)
                         continue
                     for region_order, region in enumerate(selected_regions):
+                        self._raise_if_cancelled()
                         key = (requested.isoformat(), region)
                         if key in self.checkpoint.completed:
                             self.logger.info("[%s][%s] 체크포인트 완료 항목 건너뜀", requested, region)
                             self.completed_region_names.add(region)
+                            self.completed_region_units += 1
+                            self.progress_reporter.emit(
+                                "region_completed", f"{region}의 완료된 체크포인트를 건너뜁니다.",
+                                current_date=requested.isoformat(), current_region=region,
+                                completed_regions=self.completed_region_units,
+                                total_region_units=total_region_units,
+                            )
                             continue
+                        self.progress_reporter.emit(
+                            "region_started", f"{region} 점검을 시작합니다.",
+                            current_date=requested.isoformat(), current_region=region,
+                            completed_regions=self.completed_region_units,
+                            total_region_units=total_region_units,
+                        )
                         completed = await self._audit_region(
                             page, context, checker, requested, displayed, region, region_order
                         )
                         if completed:
                             self.checkpoint.mark_completed(*key)
                             self.completed_region_names.add(region)
+                            self.completed_region_units += 1
+                            self.progress_reporter.emit(
+                                "region_completed", f"{region} 점검이 완료되었습니다.",
+                                current_date=requested.isoformat(), current_region=region,
+                                completed_regions=self.completed_region_units,
+                                total_region_units=total_region_units,
+                                processed_links=self.processed_links,
+                                normal_count=self.normal_count,
+                                error_count=self.error_count,
+                            )
+                        else:
+                            self.had_partial_failures = True
             finally:
                 # Chromium이 비정상 종료되었거나 사용자가 중단한 경우에도
                 # 이미 닫힌 객체를 다시 닫다가 원래 결과 저장을 방해하지 않는다.
@@ -278,13 +337,19 @@ class RegionalCollector:
                 self.logger.info("[%s][%s] 데이터 없음", req, region)
                 return True
             for issue_index in range(len(cards)):
+                self._raise_if_cancelled()
                 self.logger.info("[%s][%s] 이슈 %d/%d 점검", req, region, issue_index + 1, len(cards))
                 try:
                     await self._audit_issue(page, context, checker, requested, displayed, region, region_order, issue_index, len(cards))
+                except AuditCancelled:
+                    raise
                 except Exception as exc:
+                    self.had_partial_failures = True
                     self._debug("이슈순회", requested, displayed, region=region, issue_order=issue_index + 1,
                                 event="이슈 처리 실패", exception_type=type(exc).__name__, details=exc)
             return True
+        except AuditCancelled:
+            raise
         except Exception as exc:
             self._debug("지역선택", requested, displayed, region=region, event="지역 처리 실패",
                         exception_type=type(exc).__name__, details=exc)
@@ -309,6 +374,12 @@ class RegionalCollector:
           const before=h ? h.previousElementSibling : null;
           return {title:h?.innerText?.trim()||'', categories:before ? [...before.querySelectorAll(':scope > span')].map(x=>x.innerText.trim()) : []};
         }""")
+        self.progress_reporter.emit(
+            "issue_started", f"이슈 {issue_index + 1}/{issue_total} 확인 중",
+            current_date=requested.isoformat(), current_region=region,
+            current_issue=issue["title"], current_issue_order=issue_index + 1,
+            current_issue_total=issue_total,
+        )
         self.issue_keys.add((requested.isoformat(), region, issue_index + 1))
         self.checkpoint.mark_issue(requested.isoformat(), region, issue_index + 1)
         categories = ", ".join(x for x in issue["categories"] if x in ISSUE_CATEGORIES)
@@ -336,6 +407,11 @@ class RegionalCollector:
         source_match = re.fullmatch(r"출처\s*\(\s*(\d+)\s*\)", source_text)
         source_count = int(source_match.group(1)) if source_match else 0
         sources, actual_card_count = await self._source_cards(source_heading)
+        self.known_links = max(self.known_links, self.processed_links + len(sources))
+        self.progress_reporter.emit(
+            "links_discovered", f"뉴스 링크 {len(sources)}개를 확인합니다.",
+            known_links=self.known_links,
+        )
         if source_count != actual_card_count:
             self._debug("출처수집", requested, displayed, region=region, issue_order=issue_index + 1,
                         issue_title=issue["title"], event="출처수 불일치",
@@ -346,6 +422,7 @@ class RegionalCollector:
                         details=f"직접 자식 카드 {actual_card_count}, 파싱 성공 {len(sources)}")
         try:
             for source_order, (source_card, source_info) in enumerate(sources, 1):
+                self._raise_if_cancelled()
                 link_context = {
                     "requested_date": requested.isoformat(),
                     "displayed_date": displayed.isoformat() if displayed else "",
@@ -368,7 +445,13 @@ class RegionalCollector:
                     checked_at=datetime.now().astimezone().isoformat(timespec="seconds"),
                     region_order=region_order, source_order=source_order,
                 )
-                self.checkpoint.add_row(row)
+                added = self.checkpoint.add_row(row)
+                if added:
+                    self.processed_links += 1
+                    if result.verdict == "정상":
+                        self.normal_count += 1
+                    else:
+                        self.error_count += 1
                 self.checkpoint.add_debug(debug_entry(
                     "링크URL", **link_context,
                     source_href_raw=result.source_href_raw,
@@ -405,6 +488,16 @@ class RegionalCollector:
                 ))
                 self.logger.info("[%s][%s][이슈 %d] 출처 %d/%d %s", requested, region, issue_index + 1,
                                  source_order, len(sources), result.verdict)
+                self.progress_reporter.emit(
+                    "link_completed",
+                    f"뉴스 링크 {source_order}/{len(sources)} {result.verdict}",
+                    current_date=requested.isoformat(), current_region=region,
+                    current_issue=issue["title"], current_issue_order=issue_index + 1,
+                    current_issue_total=issue_total, known_links=self.known_links,
+                    processed_links=self.processed_links,
+                    normal_count=self.normal_count, error_count=self.error_count,
+                    verdict=result.verdict,
+                )
                 if result.verdict != "정상":
                     self._debug(
                         "링크판정", requested, displayed, region=region,
@@ -830,3 +923,8 @@ class RegionalCollector:
         entry = debug_entry(stage, requested_date=requested.isoformat(),
                             displayed_date=displayed.isoformat() if displayed else "", **kwargs)
         self.checkpoint.add_debug(entry)
+
+    def _raise_if_cancelled(self) -> None:
+        if self.cancellation_token.is_cancel_requested():
+            self.progress_reporter.emit("cancel_acknowledged", "중단 요청을 확인했습니다. 현재 결과를 정리합니다.")
+            raise AuditCancelled("사용자가 점검 중단을 요청했습니다.")

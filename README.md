@@ -2,7 +2,7 @@
 
 ## 프로젝트 소개
 
-이 프로그램은 빅카인즈 지역이슈 큐레이션 페이지에서 사용자가 지정한 날짜와 지역을 순회하며, 각 이슈에 연결된 뉴스·공지사항 링크가 실제로 정상 동작하는지 Playwright Chromium으로 점검하고 Excel 결과를 생성합니다.
+이 프로그램은 빅카인즈 지역이슈 큐레이션 페이지에서 사용자가 지정한 날짜와 지역을 순회하며, 각 이슈에 연결된 뉴스·공지사항 링크가 실제로 정상 동작하는지 Playwright Chromium으로 점검하고 Excel 결과를 생성합니다. 명령행 인터페이스와 로컬 전용 웹 사용자 페이지가 같은 점검 서비스를 사용합니다.
 
 - 대상 페이지: [빅카인즈 지역이슈 큐레이션](https://www.bigkinds.or.kr/regional/curation.do)
 - 현재 확인한 실행 환경: Python 3.12.10
@@ -31,6 +31,10 @@
 - 비정상 판정 및 일부 팝업·클릭 실패 시 스크린샷 저장
 - 체크포인트 저장과 `--resume` 재개
 - 날짜, 지역, 타임아웃, 재시도 횟수 등을 지정하는 명령행 인자
+- `127.0.0.1`에만 기본 바인딩하는 로컬 웹 사용자 페이지
+- 웹에서 날짜·전체 또는 복수 지역 선택, 실행·진행 확인·중단
+- 오류 필터, 원본·최종 링크 열기, Excel 다운로드
+- SQLite 기반 실행 기록 및 서버 재시작 후 기록 복원
 
 Playwright trace 저장 디렉터리는 설정에 정의되어 있지만, 현재 `main.py` 실행 흐름에는 trace를 자동 시작·저장하는 기능이 구현되어 있지 않습니다.
 
@@ -70,7 +74,7 @@ HTTP 200만으로 정상 판정하지 않습니다. HTTP 상태가 200이어도 
 
 ## 설치 방법
 
-`requirements.txt`에는 Playwright, openpyxl, pytest가 정의되어 있습니다. 별도의 Python 최소 버전 메타데이터는 없으며, 현재 프로젝트 환경에서 확인된 Python 버전은 3.12.10입니다. Windows에서 Python 3.12를 사용하는 설치 예시는 다음과 같습니다.
+`requirements.txt`에는 Playwright, openpyxl, FastAPI, Uvicorn, httpx와 pytest가 정의되어 있습니다. 별도의 Python 최소 버전 메타데이터는 없으며, 현재 프로젝트 환경에서 확인된 Python 버전은 3.12.10입니다. Windows에서 Python 3.12를 사용하는 설치 예시는 다음과 같습니다.
 
 ```powershell
 py -3.12 -m venv .venv
@@ -80,7 +84,92 @@ pip install -r requirements.txt
 python -m playwright install chromium
 ```
 
-## 실행 방법
+웹 사용자 페이지를 사용하려면 Node.js와 npm도 필요합니다. 프런트엔드는 CDN을 사용하지 않으며 `frontend/package-lock.json`에 기록된 패키지를 로컬에 설치합니다.
+
+```powershell
+cd frontend
+npm install
+npm run build
+cd ..
+```
+
+## 로컬 웹 사용자 페이지
+
+### 화면별 기능
+
+- 점검 설정: 포함 범위인 시작일·종료일, 전체 또는 17개 시도 복수 선택, headless 또는 브라우저 표시 실행, 이전 중단 작업 재개
+- 진행 화면: 날짜·지역·현재 이슈, 지역 일정 진행률, 처리 링크·정상·오류 수, 경과 시간, 접을 수 있는 최근 로그와 중단 버튼
+- 결과 화면: 전체·정상·오류·정상률, 오류 유형별 수, 오류 유형·지역·언론사·기사제목 필터, 실제 원본 링크와 최종 링크, Excel 다운로드
+- 실행 기록: 과거 작업의 기간·지역·상태·정상률·링크 수·오류 수와 남아 있는 Excel 재다운로드
+
+웹 화면은 1.5초 간격 polling으로 상태를 갱신합니다. 새로고침 시 브라우저에는 마지막 job ID만 보관하고, 실제 상태와 결과는 로컬 SQLite에서 다시 읽습니다.
+
+### 단일 서버 실행
+
+프런트엔드 빌드가 준비된 상태에서 프로젝트 루트에서 실행합니다.
+
+```powershell
+python run_web.py
+```
+
+서버는 기본적으로 `http://127.0.0.1:8000`에만 바인딩하며 기본 브라우저를 자동으로 엽니다. 프런트엔드 소스를 변경한 뒤 `dist`가 없다면 `node_modules`가 설치된 경우 실행기가 먼저 production build를 수행합니다.
+
+브라우저를 자동으로 열지 않거나 다른 로컬 포트를 사용하려면 다음과 같이 실행합니다.
+
+```powershell
+python run_web.py --no-browser
+python run_web.py --port 8080
+```
+
+### 개발 모드 실행
+
+터미널 1에서 FastAPI를 실행합니다.
+
+```powershell
+python -m uvicorn src.api.app:app --host 127.0.0.1 --port 8000 --reload
+```
+
+터미널 2에서 Vite 개발 서버를 실행합니다.
+
+```powershell
+cd frontend
+npm run dev
+```
+
+개발 화면은 `http://127.0.0.1:5173`이며 `/api` 요청은 `127.0.0.1:8000`으로 proxy됩니다. 두 서버 모두 외부 인터페이스가 아니라 loopback에 바인딩됩니다.
+
+### CLI와 웹의 차이
+
+| 항목 | CLI | 로컬 웹 |
+| --- | --- | --- |
+| 입력 | argparse 및 대화형 콘솔 | 날짜·지역 선택 화면 |
+| 실행 계층 | `AuditService` 직접 호출 | 별도 worker process에서 같은 `AuditService` 호출 |
+| 진행 확인 | 콘솔과 `work/` 로그 | SQLite 진행 상태와 최근 사용자 로그 polling |
+| 중단 | Ctrl+C | 중단 요청 버튼과 안전 경계 확인 |
+| 실행 기록 | 체크포인트·Excel 파일 | SQLite 작업 목록과 체크포인트·Excel |
+| 동시 작업 | 개별 CLI 프로세스 기준 | 로컬 안정성을 위해 한 번에 1개로 제한 |
+
+두 방식 모두 기존 `RegionalCollector`, `BrowserLinkChecker`, 판정 함수, `CheckpointStore`, `write_excel`을 공유합니다. 웹 전용 판정 규칙은 없습니다.
+
+### 제공 API
+
+| 메서드와 경로 | 용도 |
+| --- | --- |
+| `GET /api/health` | 서버 상태 확인 |
+| `GET /api/config/regions` | 코드에 정의된 17개 시도와 표시 순서 |
+| `POST /api/jobs` | 비동기 점검 작업 생성 |
+| `GET /api/jobs` | 실행 기록 목록 |
+| `GET /api/jobs/{job_id}` | 작업 상세와 진행 상태 |
+| `POST /api/jobs/{job_id}/cancel` | 협력적 중단 요청 |
+| `GET /api/jobs/{job_id}/results` | 요약과 필터된 오류 목록 |
+| `GET /api/jobs/{job_id}/download` | 생성된 Excel 다운로드 |
+| `GET /api/jobs/{job_id}/logs` | 최근 사용자용 진행 로그 |
+
+웹 작업 상태는 `대기`, `실행 중`, `중단 요청`, `중단됨`, `완료`, `일부 실패`, `실패`로 기록됩니다. Playwright 작업은 Windows `spawn` 방식의 별도 worker process에서 공통 서비스를 직접 호출하므로 한 작업의 예외가 FastAPI 서버를 종료하지 않습니다.
+
+중단 요청은 실행 중인 Chromium 프로세스를 즉시 강제 종료하지 않습니다. 현재 링크 처리를 끝낸 뒤 새 링크 시작을 중단하고 체크포인트와 현재 결과 Excel을 저장한 다음 page, context, browser를 기존 정리 경로에서 닫습니다.
+
+## CLI 실행 방법
 
 ### 대화형 실행
 
@@ -141,6 +230,8 @@ python main.py --start-date 2026-07-08 --end-date 2026-07-08 --regions 충청북
 
 - `output/`: 최종 Excel 보고서 저장. 파일명은 `bigkinds_regional_link_audit_시작일_종료일_실행시각.xlsx` 형식입니다.
 - `work/`: 체크포인트 JSONL과 실행 로그 저장. 체크포인트 파일은 날짜 범위와 지역 선택을 반영하며, 로그 파일은 `audit_시작일_종료일_실행시각.log` 형식입니다.
+- `work/web_jobs.sqlite3`: 웹 작업 설정, 상태, 최근 로그와 결과 화면용 메타데이터 저장. 기사 본문과 브라우저 쿠키·세션은 저장하지 않습니다.
+- `work/web_jobs/`: 웹 작업별 체크포인트 JSONL 저장.
 - `artifacts/screenshots/`: 비정상 링크 판정과 일부 팝업·클릭 실패 화면의 PNG 스크린샷 저장.
 - `artifacts/traces/`: 수동 진단 trace를 둘 수 있는 경로입니다. 현재 일반 실행에서는 trace ZIP을 자동 생성하지 않습니다.
 - `logs/`: 현재 프로그램이 사용하는 로그 경로가 아닙니다. 실행 로그는 `work/`에 저장됩니다.
@@ -164,11 +255,48 @@ python -m pytest -q
 
 테스트에는 날짜·지역 처리, URL 정규화와 중복 제거, 판정 규칙, Excel 생성 및 로컬 HTTP 서버를 이용한 브라우저 흐름 검증이 포함됩니다. 자동화 테스트는 실제 빅카인즈 운영 사이트에 의존하지 않습니다.
 
+프런트엔드 DOM 테스트와 production build는 다음과 같이 확인합니다.
+
+```powershell
+cd frontend
+npm test
+npm run build
+cd ..
+```
+
 실제 사이트를 소규모로 확인하려면 현재 지원되는 `--max-issues` 옵션을 사용합니다.
 
 ```powershell
 python main.py --start-date 2026-07-08 --end-date 2026-07-08 --regions 충청북도 --max-issues 1
 ```
+
+## 프로젝트 구조
+
+```text
+main.py                         CLI 입력 처리
+run_web.py                      loopback 전용 단일 웹 서버 실행
+src/application/audit_service.py  CLI·웹 공통 실행 서비스
+src/application/job_manager.py    worker process와 중단 요청 관리
+src/application/job_repository.py SQLite 작업·로그·결과 저장
+src/api/                        FastAPI 앱과 jobs API
+src/regional_collector.py       기존 빅카인즈 순회·실제 클릭 흐름
+src/link_checker.py             기존 렌더링 검사
+src/verdict.py                  기존 최종 판정
+src/checkpoint.py               기존 JSONL 체크포인트
+src/excel_writer.py             기존 4개 시트 Excel 생성
+frontend/                       React·TypeScript·Vite 소스
+tests/                          기존 회귀 및 API·작업 관리자 테스트
+```
+
+## 문제 해결
+
+- 브라우저가 자동으로 열리지 않으면 직접 `http://127.0.0.1:8000`에 접속합니다.
+- 첫 화면에 프런트엔드 빌드가 없다는 안내가 나오면 `frontend`에서 `npm install`과 `npm run build`를 실행합니다.
+- API 서버 연결 안내가 나오면 `run_web.py`를 실행한 콘솔이 종료되지 않았는지 확인합니다.
+- Chromium 실행 파일 오류가 나오면 `python -m playwright install chromium`을 다시 실행합니다.
+- 이미 실행 중인 작업 안내가 나오면 상단의 `진행 중인 점검`에서 기존 작업을 확인하거나 중단합니다.
+- 완료된 작업의 Excel 다운로드가 비활성화되면 `output/`의 해당 파일이 삭제된 상태입니다. 실행 기록은 남아 있어도 삭제된 파일은 복원하지 않습니다.
+- 서버가 실행 도중 종료되면 기록은 SQLite에 남습니다. 다음 시작 시 미완료 상태는 실패 또는 일부 실패로 정리되며, 체크포인트가 남은 작업은 설정 화면에서 재개할 수 있습니다.
 
 ## 주의사항
 

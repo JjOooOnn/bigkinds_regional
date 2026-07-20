@@ -59,6 +59,19 @@ test-results/
 playwright-report/
 blob-report/
 
+# Frontend dependencies and build output
+frontend/node_modules/
+frontend/dist/
+frontend/*.tsbuildinfo
+frontend/coverage/
+frontend/vite.config.js
+frontend/vite.config.d.ts
+
+# Local web application state
+/work/web_jobs.sqlite3
+/work/web_jobs.sqlite3-shm
+/work/web_jobs.sqlite3-wal
+
 # Generated Excel/CSV files
 *.xlsx
 *.xls

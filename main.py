@@ -1,22 +1,14 @@
 from __future__ import annotations
 
 import argparse
-import asyncio
 import sys
-from datetime import datetime
 
-from src.checkpoint import CheckpointStore
-from src.config import OUTPUT_DIR, WORK_DIR
+from src.application.audit_service import AuditRequest, AuditService
 from src.date_navigation import parse_iso_date, validate_date_range
-from src.excel_writer import write_excel
-from src.logging_utils import sanitize, setup_logging
-from src.regional_collector import RegionalCollector
 from src.regions import (
-    is_all_regions,
     parse_cli_regions,
     print_region_confirmation,
     prompt_regions,
-    resume_checkpoint_path,
 )
 
 
@@ -76,57 +68,30 @@ def main(argv: list[str] | None = None) -> int:
     if args.max_issues is not None and args.max_issues < 1:
         parser.error("--max-issues는 1 이상이어야 합니다.")
     start_text, end_text = resolve_dates(args, parser)
-    start_date, end_date = validate_date_range(start_text, end_text)
+    validate_date_range(start_text, end_text)
     regions = resolve_regions(args, parser)
-    run_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    started_at = datetime.now().astimezone()
-    logger = setup_logging(WORK_DIR / f"audit_{start_text}_{end_text}_{run_stamp}.log")
-    selected_checkpoint = resume_checkpoint_path(
-        WORK_DIR, start_text, end_text, regions, resume=args.resume,
-    )
-    checkpoint_config = {
-        "start_date": start_text,
-        "end_date": end_text,
-        "regions": regions,
-        "selection_mode": "전체" if is_all_regions(regions) else "선택",
-    }
     try:
-        checkpoint = CheckpointStore(
-            selected_checkpoint, resume=args.resume, run_config=checkpoint_config,
+        result = AuditService().run(
+            AuditRequest(
+                start_date=start_text,
+                end_date=end_text,
+                regions=regions,
+                headed=args.headed,
+                resume=args.resume,
+                max_issues=args.max_issues,
+                timeout_seconds=args.timeout,
+                retries=args.retries,
+                link_delay_seconds=args.link_delay,
+                debug=args.debug,
+            )
         )
     except ValueError as exc:
         parser.error(str(exc))
-
-    collector = RegionalCollector(
-        start_date=start_date, end_date=end_date, regions=regions, headed=args.headed,
-        max_issues=args.max_issues, timeout_ms=args.timeout * 1000, retries=args.retries,
-        link_delay_ms=max(0, int(args.link_delay * 1000)), checkpoint=checkpoint,
-        logger=logger, debug=args.debug,
-    )
-    interrupted = False
-    failed = False
-    try:
-        asyncio.run(collector.run())
-    except KeyboardInterrupt:
-        interrupted = True
-        logger.warning("사용자 중단: 현재까지 수집한 결과를 저장합니다.")
-    except Exception as exc:
-        failed = True
-        logger.error("실행 중 오류가 발생했지만 현재까지 결과를 저장합니다: %s", sanitize(exc))
-
-    ended_at = datetime.now().astimezone()
-    output_path = OUTPUT_DIR / f"bigkinds_regional_link_audit_{start_text}_{end_text}_{run_stamp}.xlsx"
-    completed_regions = len({region for _, region in checkpoint.completed})
-    excel_path = write_excel(
-        output_path, checkpoint.rows, checkpoint.debug_entries,
-        start_date=start_text, end_date=end_text, started_at=started_at, ended_at=ended_at,
-        region_count=completed_regions, issue_count=len(checkpoint.issue_keys),
-        selected_regions=regions,
-    )
-    print(f"Excel 파일: {excel_path}")
-    if interrupted:
+    if result.excel_path:
+        print(f"Excel 파일: {result.excel_path}")
+    if result.status == "cancelled":
         return 130
-    return 1 if failed else 0
+    return 1 if result.status == "failed" else 0
 
 
 if __name__ == "__main__":
