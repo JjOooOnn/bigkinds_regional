@@ -1,0 +1,73 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+build/
+dist/
+*.egg-info/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# PyCharm / IDE
+.idea/
+.ai/
+*.iml
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Generated results (keep an optional directory placeholder)
+output/*
+!output/.gitkeep
+result/*
+!result/.gitkeep
+results/*
+!results/.gitkeep
+
+# Runtime work and checkpoints
+work/*
+!work/.gitkeep
+checkpoints/*
+!checkpoints/.gitkeep
+
+# Logs
+logs/*
+!logs/.gitkeep
+*.log
+
+# Playwright artifacts
+.playwright-mcp/
+artifacts/screenshots/*
+!artifacts/screenshots/.gitkeep
+artifacts/traces/*
+!artifacts/traces/.gitkeep
+test-results/
+playwright-report/
+blob-report/
+
+# Generated Excel/CSV files
+*.xlsx
+*.xls
+/bigkinds_regional_link_audit*.csv
+
+# Manually generated diagnostic screenshots
+/ggilbo_*_mcp_*.png
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
