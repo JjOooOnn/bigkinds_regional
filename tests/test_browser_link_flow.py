@@ -51,6 +51,13 @@ class _Handler(BaseHTTPRequestHandler):
                 "<button><span class='text'>댓글입력 권한이 없습니다.</span></button>"
                 "</header></article></main>",
             ),
+            "/article-ad-403": (
+                200,
+                f"<title>{ARTICLE_TITLE}</title><h1>{ARTICLE_TITLE}</h1>"
+                f"<main><article itemprop='articleBody'><p>{ARTICLE_BODY}</p></article></main>"
+                "<img src='/ad-403' alt='광고'>",
+            ),
+            "/ad-403": (403, "forbidden advertisement"),
             "/404": (404, "<title>404 Not Found</title><h1>404 Not Found</h1>"),
             "/soft-404": (200, "<title>404</title><h1>404</h1><p>파일 또는 디렉터리를 찾을 수 없습니다.</p>"),
             "/403": (403, "<title>Access Denied</title><h1>Access Denied</h1>"),
@@ -220,6 +227,40 @@ def test_local_browser_link_flows_and_verdicts():
             assert forbidden.access_reason_code == "ACCESS_HTTP_STATUS"
             assert captcha.access_reason_code == "ACCESS_STRONG_TEXT_PRIMARY"
 
+            # 하위 광고 응답의 403은 context response 이벤트에 보이더라도
+            # 메인 document 상태와 기사 판정을 덮어쓰면 안 된다.
+            ad_page = await context.new_page()
+            failed_responses = []
+
+            def record_failed_response(failed_response):
+                if failed_response.status >= 400:
+                    failed_responses.append({
+                        "status": failed_response.status,
+                        "url": failed_response.url,
+                        "resource_type": failed_response.request.resource_type,
+                        "navigation": failed_response.request.is_navigation_request(),
+                        "main_frame": failed_response.frame == ad_page.main_frame,
+                    })
+
+            ad_page.on("response", record_failed_response)
+            ad_main_response = await ad_page.goto(base + "/article-ad-403", wait_until="domcontentloaded")
+            await ad_page.wait_for_timeout(100)
+            assert ad_main_response.status == 200
+            assert collector.status_by_page[ad_page] == 200
+            assert failed_responses == [{
+                "status": 403,
+                "url": base + "/ad-403",
+                "resource_type": "image",
+                "navigation": False,
+                "main_frame": True,
+            }]
+            ad_result = await checker.inspect_open_page(
+                ad_page, ad_page.url, time.perf_counter(), collector.status_by_page,
+                expected_title=ARTICLE_TITLE, status_by_url=collector.status_by_url,
+            )
+            assert (ad_result.http_status, ad_result.verdict, ad_result.link_working_yn) == (200, "정상", "Y")
+            await ad_page.close()
+
             slow_page = await context.new_page()
             fast_checker = BrowserLinkChecker(timeout_ms=300, retries=1)
             slow_result = await fast_checker.open_url(
@@ -237,6 +278,58 @@ def test_local_browser_link_flows_and_verdicts():
             )
             assert no_response_result.verdict == "정상"
             await no_response.close()
+            await context.close()
+            await browser.close()
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_headless_main_403_can_be_reclassified_after_article_dom_verification():
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    url = f"http://127.0.0.1:{server.server_address[1]}/article"
+
+    async def scenario():
+        checkpoint = _Checkpoint()
+        collector = RegionalCollector(
+            start_date=date(2026, 7, 3), end_date=date(2026, 7, 3), regions=None,
+            headed=False, max_issues=None, timeout_ms=1_000, retries=0,
+            link_delay_ms=0, checkpoint=checkpoint, logger=logging.getLogger("test"),
+        )
+        primary = LinkCheckResult(
+            original_url=url, final_url=url, http_status=403,
+            browser_result="접근 제한", link_working_yn="N", verdict="접근제한",
+            error_message="HTTP 403 - 접근 또는 인증이 제한됨",
+            access_reason_code="ACCESS_HTTP_STATUS",
+            document_title="Attention Required! | Cloudflare",
+            visible_h1="Sorry, you have been blocked",
+            article_rendered_yn="N",
+        )
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            context = await browser.new_context(locale="ko-KR")
+            collector._playwright = playwright
+            collector._verification_context = AsyncMock(return_value=context)
+            verified = await collector._verify_automation_environment_block(
+                primary, url, ARTICLE_TITLE,
+                {
+                    "requested_date": "2026-07-03", "displayed_date": "2026-07-03",
+                    "region": "전북특별자치도", "issue_order": 1, "issue_title": "테스트 이슈",
+                },
+                time.perf_counter(),
+            )
+            assert (verified.http_status, verified.verdict, verified.link_working_yn) == (200, "정상", "Y")
+            assert verified.article_rendered_yn == "Y"
+            assert verified.access_reason_code == "ARTICLE_RENDERED_AFTER_AUTOMATION_BLOCK"
+            assert checkpoint.debug_entries[-1].stage == "브라우저환경비교"
+            assert checkpoint.debug_entries[-1].event == "자동화 환경 차단"
+            assert "기본 main document HTTP=403" in checkpoint.debug_entries[-1].details
             await context.close()
             await browser.close()
 

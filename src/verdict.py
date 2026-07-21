@@ -88,8 +88,45 @@ def classify_verdict_detailed(
         if file_not_found else "404 또는 페이지 없음 화면 표시"
     )
 
-    # 상태 코드가 화면 문구보다 우선한다. 다만 구체적인 화면 문구가 있으면
-    # 오류내용에는 사용자가 확인할 수 있는 문구를 남긴다.
+    if explicit_not_found and not article_rendered:
+        marker = next((marker for marker in NOT_FOUND_MARKERS if marker in primary or marker in combined), "404")
+        return VerdictDecision(
+            "링크오류", "표시 실패", not_found_error, "NOT_FOUND_TEXT_MATCH", marker,
+        )
+    if not article_rendered and any(marker in combined for marker in SERVER_MARKERS):
+        marker = next(marker for marker in SERVER_MARKERS if marker in combined)
+        return VerdictDecision(
+            "서버오류", "표시 실패", "서버 오류 화면 표시", "SERVER_ERROR_TEXT_MATCH", marker,
+        )
+
+    strong_marker = next((marker for marker in STRONG_BLOCK_MARKERS if marker in combined), "")
+    primary_strong_marker = next((marker for marker in STRONG_BLOCK_MARKERS if marker in primary), "")
+    # 정상 기사에 딸린 댓글·구독·로그인 같은 보조 기능도 권한/CAPTCHA 문구를
+    # 표시할 수 있다. 실제 기사 렌더링 근거가 있으면 주요 콘텐츠 안에서 확인된
+    # 문구만 페이지 전체의 접근 제한 근거로 사용한다.
+    if article_rendered and primary_strong_marker:
+        reason = "CAPTCHA 또는 접근 제한 화면 표시" if strong_marker == "captcha" else "접근 또는 인증이 제한됨"
+        return VerdictDecision(
+            "접근제한", "접근 제한", reason,
+            "ACCESS_STRONG_TEXT_PRIMARY", primary_strong_marker,
+        )
+    # 댓글·북마크·구독 기능의 로그인 안내는 정상 기사에도 표시된다. 실제
+    # 기사 제목과 충분한 본문이 렌더링된 경우에는 페이지 전체 접근 제한으로
+    # 해석하지 않는다.
+    login_marker = next((marker for marker in LOGIN_REQUIRED_MARKERS if marker in combined), "")
+    if article_rendered:
+        # 브라우저 DOM에서 기사 제목과 본문을 실제로 확인한 결과가 최우선이다.
+        # 상태 코드는 메인 document 값이어도 중간 보안 계층이나 별도 HTTP 진단과
+        # 화면 결과가 어긋날 수 있으므로, 정상 기사 DOM을 오류로 덮어쓰지 않는다.
+        if http_status is not None and http_status >= 400:
+            code = "ARTICLE_RENDERED_HTTP_STATUS_IGNORED"
+        elif strong_marker:
+            code = "ARTICLE_RENDERED_AUXILIARY_ACCESS_TEXT_IGNORED"
+        else:
+            code = "ARTICLE_RENDERED"
+        return VerdictDecision("정상", "정상 표시", "", code, strong_marker)
+
+    # 기사 DOM 근거가 없을 때만 메인 document 상태 코드를 오류 판정에 쓴다.
     if http_status in (404, 410):
         return VerdictDecision(
             "링크오류", "표시 실패",
@@ -100,43 +137,20 @@ def classify_verdict_detailed(
         return VerdictDecision(
             "서버오류", "표시 실패", "서버 오류 화면 표시", "HTTP_SERVER_ERROR",
         )
-    if explicit_not_found and not article_rendered:
-        marker = next((marker for marker in NOT_FOUND_MARKERS if marker in primary or marker in combined), "404")
-        return VerdictDecision(
-            "링크오류", "표시 실패", not_found_error, "NOT_FOUND_TEXT_MATCH", marker,
-        )
-    if any(marker in combined for marker in SERVER_MARKERS):
-        marker = next(marker for marker in SERVER_MARKERS if marker in combined)
-        return VerdictDecision(
-            "서버오류", "표시 실패", "서버 오류 화면 표시", "SERVER_ERROR_TEXT_MATCH", marker,
-        )
-
-    strong_marker = next((marker for marker in STRONG_BLOCK_MARKERS if marker in combined), "")
-    primary_strong_marker = next((marker for marker in STRONG_BLOCK_MARKERS if marker in primary), "")
     if http_status in (401, 403):
         return VerdictDecision(
             "접근제한", "접근 제한", f"HTTP {http_status} - 접근 또는 인증이 제한됨",
             "ACCESS_HTTP_STATUS", strong_marker,
         )
-    # 정상 기사에 딸린 댓글·구독·로그인 같은 보조 기능도 권한/CAPTCHA 문구를
-    # 표시할 수 있다. 실제 기사 렌더링 근거가 있으면 주요 콘텐츠 안에서 확인된
-    # 문구만 페이지 전체의 접근 제한 근거로 사용한다.
-    if strong_marker and (primary_strong_marker or not article_rendered):
+    if strong_marker:
         reason = "CAPTCHA 또는 접근 제한 화면 표시" if strong_marker == "captcha" else "접근 또는 인증이 제한됨"
         code = "ACCESS_STRONG_TEXT_PRIMARY" if primary_strong_marker else "ACCESS_STRONG_TEXT_NO_ARTICLE"
         return VerdictDecision("접근제한", "접근 제한", reason, code, primary_strong_marker or strong_marker)
-    # 댓글·북마크·구독 기능의 로그인 안내는 정상 기사에도 표시된다. 실제
-    # 기사 제목과 충분한 본문이 렌더링된 경우에는 페이지 전체 접근 제한으로
-    # 해석하지 않는다.
-    login_marker = next((marker for marker in LOGIN_REQUIRED_MARKERS if marker in combined), "")
-    if login_marker and not article_rendered:
+    if login_marker:
         return VerdictDecision(
             "접근제한", "접근 제한", "로그인이 필요한 화면 표시",
             "ACCESS_LOGIN_REQUIRED_NO_ARTICLE", login_marker,
         )
-    if article_rendered:
-        code = "ARTICLE_RENDERED_AUXILIARY_ACCESS_TEXT_IGNORED" if strong_marker else "ARTICLE_RENDERED"
-        return VerdictDecision("정상", "정상 표시", "", code, strong_marker)
 
     meaningful = len(re.sub(r"\s+", "", body_text or "")) >= 40
     if not meaningful:

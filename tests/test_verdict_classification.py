@@ -25,11 +25,21 @@ def test_classifications(kwargs, expected):
     assert classify(**kwargs)[0] == expected
 
 
-def test_direct_request_failure_does_not_override_browser_success():
-    # 상태를 읽지 못해도 실제 기사 제목과 본문 근거가 확인되면 정상이다.
-    verdict, _, _ = classify(status=None, article_rendered=True)
-    assert verdict == "정상"
-    assert working_yn(verdict) == "Y"
+@pytest.mark.parametrize("diagnostic_http_status", [None, 403])
+def test_direct_request_failure_does_not_override_browser_success(diagnostic_http_status):
+    # 직접 HTTP 상태를 읽지 못했거나 403이어도 브라우저의 기사 DOM 성공이 최우선이다.
+    decision = classify_verdict_detailed(
+        http_status=diagnostic_http_status,
+        final_url="https://example.com/article",
+        title="정상 기사 제목",
+        body_text="정상 기사 본문 " * 100,
+        primary_text="정상 기사 제목\n" + ("정상 기사 본문 " * 100),
+        article_rendered=True,
+    )
+    assert decision.verdict == "정상"
+    assert working_yn(decision.verdict) == "Y"
+    if diagnostic_http_status == 403:
+        assert decision.reason_code == "ARTICLE_RENDERED_HTTP_STATUS_IGNORED"
 
 
 def test_http_404_is_link_error_and_not_working():
@@ -130,10 +140,40 @@ def test_login_required_page_without_article_remains_blocked():
     assert verdict == "접근제한"
 
 
-@pytest.mark.parametrize("status, body", [(403, "정상 기사 본문 " * 30), (200, "CAPTCHA " * 30)])
-def test_strong_access_signal_stays_blocked_even_with_article_evidence(status, body):
+def test_main_document_403_without_article_content_is_not_working():
     verdict, _, _ = classify_verdict(
-        http_status=status, final_url="https://example.com/article",
+        http_status=403, final_url="https://example.com/article",
+        title="Access Denied", body_text="Sorry, you have been blocked.",
+        primary_text="Access Denied\nSorry, you have been blocked.",
+        article_rendered=False,
+    )
+    assert (verdict, working_yn(verdict)) == ("접근제한", "N")
+
+
+def test_http_200_access_notice_page_is_not_working():
+    verdict, _, _ = classify_verdict(
+        http_status=200, final_url="https://example.com/article",
+        title="접근 제한", body_text="이 페이지에 접근 권한이 없습니다.",
+        primary_text="접근 제한\n이 페이지에 접근 권한이 없습니다.",
+        article_rendered=False,
+    )
+    assert (verdict, working_yn(verdict)) == ("접근제한", "N")
+
+
+def test_http_200_rendered_article_is_working():
+    verdict, _, _ = classify_verdict(
+        http_status=200, final_url="https://example.com/article",
+        title="정상 기사 제목", body_text="정상 기사 본문 " * 100,
+        primary_text="정상 기사 제목\n" + ("정상 기사 본문 " * 100),
+        article_rendered=True,
+    )
+    assert (verdict, working_yn(verdict)) == ("정상", "Y")
+
+
+def test_primary_captcha_stays_blocked_even_with_article_evidence():
+    body = "CAPTCHA " * 30
+    verdict, _, _ = classify_verdict(
+        http_status=200, final_url="https://example.com/article",
         title="기사", body_text=body, primary_text=body, article_rendered=True,
     )
     assert verdict == "접근제한"

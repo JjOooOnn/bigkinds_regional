@@ -4,7 +4,15 @@ import re
 import time
 from datetime import date, datetime
 
-from playwright.async_api import BrowserContext, Locator, Page, TimeoutError as PlaywrightTimeoutError, async_playwright
+from playwright.async_api import (
+    Browser,
+    BrowserContext,
+    Locator,
+    Page,
+    Playwright,
+    TimeoutError as PlaywrightTimeoutError,
+    async_playwright,
+)
 
 from .checkpoint import CheckpointStore
 from .config import ISSUE_CATEGORIES, SCREENSHOT_DIR, TARGET_URL
@@ -21,6 +29,12 @@ from .application.progress import (
     NeverCancelToken,
     NullProgressReporter,
     ProgressReporter,
+)
+
+
+AUTOMATION_VERIFICATION_ENVIRONMENTS = (
+    ("번들 Chromium headed", {"headless": False}),
+    ("Microsoft Edge headed", {"headless": False, "channel": "msedge"}),
 )
 
 
@@ -57,9 +71,12 @@ class RegionalCollector:
         self.status_by_page: dict[Page, int] = {}
         self.status_by_url: dict[str, int] = {}
         self.first_url_by_page: dict[Page, str] = {}
+        self._playwright: Playwright | None = None
+        self._verification_sessions: dict[str, tuple[Browser, BrowserContext]] = {}
 
     async def run(self) -> tuple[list[AuditRow], list]:
         async with async_playwright() as playwright:
+            self._playwright = playwright
             browser = await playwright.chromium.launch(headless=not self.headed)
             context = await browser.new_context(locale="ko-KR")
             context.set_default_timeout(self.timeout_ms)
@@ -133,6 +150,8 @@ class RegionalCollector:
                         else:
                             self.had_partial_failures = True
             finally:
+                await self._close_verification_sessions()
+                self._playwright = None
                 # Chromium이 비정상 종료되었거나 사용자가 중단한 경우에도
                 # 이미 닫힌 객체를 다시 닫다가 원래 결과 저장을 방해하지 않는다.
                 try:
@@ -144,6 +163,112 @@ class RegionalCollector:
                 except Exception:
                     pass
         return self.checkpoint.rows, self.checkpoint.debug_entries
+
+    async def _verification_context(
+        self, environment: str, launch_options: dict[str, object],
+    ) -> BrowserContext:
+        existing = self._verification_sessions.get(environment)
+        if existing is not None:
+            return existing[1]
+        if self._playwright is None:
+            raise RuntimeError("대체 브라우저 검증에 사용할 Playwright 실행기가 없습니다.")
+        browser = await self._playwright.chromium.launch(**launch_options)
+        context = await browser.new_context(locale="ko-KR")
+        context.set_default_timeout(self.timeout_ms)
+        self._verification_sessions[environment] = (browser, context)
+        return context
+
+    async def _close_verification_sessions(self) -> None:
+        sessions = list(self._verification_sessions.values())
+        self._verification_sessions.clear()
+        for browser, _ in reversed(sessions):
+            try:
+                await browser.close()
+            except Exception:
+                pass
+
+    async def _verify_automation_environment_block(
+        self, primary: LinkCheckResult, url: str, expected_title: str,
+        debug_context: dict, started_at: float,
+    ) -> LinkCheckResult:
+        """headless 메인 문서만 403인 경우 headed 브라우저의 실제 DOM을 재확인한다."""
+        should_verify = (
+            not self.headed
+            and primary.verdict == "접근제한"
+            and primary.http_status in (401, 403)
+            and primary.article_rendered_yn != "Y"
+            and bool(url)
+        )
+        if not should_verify or self._playwright is None:
+            return primary
+
+        attempts: list[str] = []
+        for environment, launch_options in AUTOMATION_VERIFICATION_ENVIRONMENTS:
+            page: Page | None = None
+            try:
+                context = await self._verification_context(environment, launch_options)
+                page = await context.new_page()
+                verifier = BrowserLinkChecker(self.timeout_ms, retries=0)
+                verified = await verifier.open_url(
+                    page, url, started_at, {}, expected_title=expected_title,
+                )
+                attempts.append(
+                    f"{environment}: main_status={verified.http_status}, "
+                    f"판정={verified.verdict}, 기사렌더링={verified.article_rendered_yn}"
+                )
+                if verified.verdict != "정상" or verified.article_rendered_yn != "Y":
+                    continue
+
+                verified.access_reason_code = "ARTICLE_RENDERED_AFTER_AUTOMATION_BLOCK"
+                details = (
+                    "기본환경=번들 Chromium headless; "
+                    f"기본 main document HTTP={primary.http_status}; "
+                    f"기본 document.title={primary.document_title}; 기본 h1={primary.visible_h1}; "
+                    f"검증환경={environment}; 검증 main document HTTP={verified.http_status}; "
+                    f"기사제목일치={verified.article_title_match_yn}; 기사렌더링={verified.article_rendered_yn}"
+                )
+                self.checkpoint.add_debug(debug_entry(
+                    "브라우저환경비교", **debug_context,
+                    original_url=url, final_url=verified.final_url,
+                    event="자동화 환경 차단", details=details,
+                    http_status=primary.http_status if primary.http_status is not None else "",
+                    access_reason_code=verified.access_reason_code,
+                    document_title=verified.document_title,
+                    visible_h1=verified.visible_h1,
+                    article_exists_yn=verified.article_exists_yn,
+                    primary_text_length=verified.primary_text_length,
+                    article_title_match_yn=verified.article_title_match_yn,
+                    article_rendered_yn=verified.article_rendered_yn,
+                ))
+                self.logger.info(
+                    "자동화 환경 차단 확인: headless HTTP %s, %s HTTP %s, 기사 DOM 정상",
+                    primary.http_status, environment, verified.http_status,
+                )
+                return verified
+            except Exception as exc:
+                attempts.append(f"{environment}: {type(exc).__name__} {sanitize(exc)}")
+            finally:
+                try:
+                    if page is not None and not page.is_closed():
+                        await page.close()
+                except Exception:
+                    pass
+
+        self.checkpoint.add_debug(debug_entry(
+            "브라우저환경비교", **debug_context,
+            original_url=url, final_url=primary.final_url,
+            event="자동화 환경 재검증 실패",
+            details="; ".join(attempts),
+            http_status=primary.http_status if primary.http_status is not None else "",
+            access_reason_code=primary.access_reason_code,
+            document_title=primary.document_title,
+            visible_h1=primary.visible_h1,
+            article_exists_yn=primary.article_exists_yn,
+            primary_text_length=primary.primary_text_length,
+            article_title_match_yn=primary.article_title_match_yn,
+            article_rendered_yn=primary.article_rendered_yn,
+        ))
+        return primary
 
     def _track_navigation(self, context: BrowserContext) -> None:
         def on_page(page: Page):
@@ -687,6 +812,10 @@ class RegionalCollector:
                     target, original_url or target.url, started, self.status_by_page,
                     expected_title=expected_title, status_by_url=self.status_by_url,
                 )
+                result = await self._verify_automation_environment_block(
+                    result, original_url or target.url, expected_title,
+                    debug_context, started,
+                )
                 self._attach_url_diagnostics(
                     result, original_url=original_url or result.original_url,
                     source_href_raw=source_href_raw,
@@ -773,6 +902,9 @@ class RegionalCollector:
             result = await checker.open_url(
                 target, original_url, started, self.status_by_page,
                 expected_title=expected_title, status_by_url=self.status_by_url,
+            )
+            result = await self._verify_automation_environment_block(
+                result, original_url, expected_title, debug_context, started,
             )
             self._attach_url_diagnostics(
                 result, original_url=original_url,
