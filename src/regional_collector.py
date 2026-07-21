@@ -534,7 +534,7 @@ class RegionalCollector:
         sources, actual_card_count = await self._source_cards(source_heading)
         self.known_links = max(self.known_links, self.processed_links + len(sources))
         self.progress_reporter.emit(
-            "links_discovered", f"뉴스 링크 {len(sources)}개를 확인합니다.",
+            "links_discovered", f"출처 링크 {len(sources)}개를 확인합니다.",
             known_links=self.known_links,
         )
         if source_count != actual_card_count:
@@ -615,7 +615,7 @@ class RegionalCollector:
                                  source_order, len(sources), result.verdict)
                 self.progress_reporter.emit(
                     "link_completed",
-                    f"뉴스 링크 {source_order}/{len(sources)} {result.verdict}",
+                    f"출처 링크 {source_order}/{len(sources)} {result.verdict}",
                     current_date=requested.isoformat(), current_region=region,
                     current_issue=issue["title"], current_issue_order=issue_index + 1,
                     current_issue_total=issue_total, known_links=self.known_links,
@@ -682,12 +682,15 @@ class RegionalCollector:
                   const kids=[...e.children];
                   const type=kids.find(x=>x.tagName==='SPAN')?.innerText?.trim();
                   const divs=kids.filter(x=>x.tagName==='DIV');
-                  return ['뉴스','공지사항'].includes(type) && divs.length === 2 &&
-                         /20\d{2}-\d{2}-\d{2}/.test(divs[0].innerText||'');
+                  const metadata=(divs[0]?.innerText||'').trim();
+                  const title=(divs[1]?.innerText||'').trim();
+                  return Boolean(type) && divs.length === 2 && Boolean(title) &&
+                         /\b\d{4}[-.]\d{2}[-.]\d{2}\b/.test(metadata);
                 }""")
                 if valid:
                     info = parse_source_text(await candidate.inner_text(), len(result) + 1)
-                    result.append((candidate, info))
+                    if info.source_type and info.article_date and info.title:
+                        result.append((candidate, info))
             except Exception:
                 continue
         return result, actual_card_count

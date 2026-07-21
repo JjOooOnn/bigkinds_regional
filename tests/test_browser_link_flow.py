@@ -124,6 +124,42 @@ def test_structured_article_body_can_confirm_article_after_headline_edit():
     )
 
 
+def test_source_cards_use_structure_instead_of_source_type_allowlist():
+    async def scenario():
+        checkpoint = _Checkpoint()
+        collector = RegionalCollector(
+            start_date=date(2026, 7, 21), end_date=date(2026, 7, 21), regions=None,
+            headed=False, max_issues=None, timeout_ms=1_000, retries=0,
+            link_delay_ms=0, checkpoint=checkpoint, logger=logging.getLogger("test"),
+        )
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            page = await browser.new_page()
+            await page.set_content("""
+                <h3 id="source-heading">출처 (7)</h3>
+                <div id="source-list">
+                  <div><span>뉴스</span><div>언론사 | 2026-07-21</div><div>뉴스 제목</div></div>
+                  <div><span>공지사항</span><div>기관 | 2026.07.21</div><div>공지 제목</div></div>
+                  <div><span>연구보고서</span><div>연구원 | 2026-07-20</div><div>연구보고서 제목</div></div>
+                  <div><span>새 출처 유형</span><div>새 기관 | 2026-07-19</div><div>새 유형 제목</div></div>
+                  <div><span></span><div>기관 | 2026-07-21</div><div>유형 없는 제목</div></div>
+                  <div><span>새 출처</span><div>기관</div><div>날짜 없는 제목</div></div>
+                  <div><span>새 출처</span><div>기관 | 2026-07-21</div><div> </div></div>
+                </div>
+            """)
+            sources, actual_card_count = await collector._source_cards(page.locator("#source-heading"))
+            assert actual_card_count == 7
+            assert [info.source_type for _, info in sources] == [
+                "뉴스", "공지사항", "연구보고서", "새 출처 유형",
+            ]
+            assert [info.title for _, info in sources] == [
+                "뉴스 제목", "공지 제목", "연구보고서 제목", "새 유형 제목",
+            ]
+            await browser.close()
+
+    asyncio.run(scenario())
+
+
 def test_local_browser_link_flows_and_verdicts():
     server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
     thread = Thread(target=server.serve_forever, daemon=True)

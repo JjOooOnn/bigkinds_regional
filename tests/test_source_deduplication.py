@@ -23,9 +23,17 @@ def test_parse_news_text():
     assert (info.source_type, info.publisher, info.article_date, info.title) == ("뉴스", "데일리안", "2026-07-01", "기사 제목")
 
 
+def test_parse_research_report_text():
+    info = parse_source_text("연구보고서\n전남연구원 | 2026-07-20\n연구보고서 제목")
+    assert (info.source_type, info.publisher, info.article_date, info.title) == (
+        "연구보고서", "전남연구원", "2026-07-20", "연구보고서 제목",
+    )
+
+
 def test_parse_notice_and_missing_fields():
     notice = parse_source_text("공지사항\n서울시 | 2026.07.01\n공지 제목")
     missing = parse_source_text("뉴스\n제목만 있음")
-    assert (notice.publisher, notice.article_date, notice.title) == ("서울시", "2026-07-01", "공지 제목")
+    assert (notice.source_type, notice.publisher, notice.article_date, notice.title) == (
+        "공지사항", "서울시", "2026-07-01", "공지 제목",
+    )
     assert missing.publisher == "" and missing.article_date == "" and missing.title == "제목만 있음"
-
