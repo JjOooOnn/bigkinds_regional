@@ -46,6 +46,7 @@ TEXT_ACCESS_REASON_CODES = {
 @dataclass
 class LinkCheckResult:
     original_url: str = ""
+    inspection_url: str = ""
     final_url: str = ""
     http_status: int | None = None
     browser_result: str = "표시 실패"
@@ -68,6 +69,7 @@ class LinkCheckResult:
     inferred_url: str = ""
     url_structure_anomaly_yn: str = "N"
     url_structure_anomaly_details: str = ""
+    url_html_entity_unescaped_yn: str = "N"
     access_reason_code: str = ""
     detected_phrase: str = ""
     detected_locator: str = ""
@@ -84,6 +86,15 @@ class LinkCheckResult:
     matched_title: str = ""
     content_container_locator: str = ""
     attachment_exists_yn: str = "N"
+    body_text_length: int = 0
+    render_recheck_yn: str = "N"
+    initial_body_text_length: int = 0
+    rechecked_body_text_length: int = 0
+    initial_document_title: str = ""
+    rechecked_document_title: str = ""
+    initial_verdict: str = ""
+    rechecked_verdict: str = ""
+    render_recheck_wait_seconds: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -143,9 +154,13 @@ def article_rendered_evidence(
 
 
 class BrowserLinkChecker:
-    def __init__(self, timeout_ms: int = 30_000, retries: int = 2):
+    def __init__(
+        self, timeout_ms: int = 30_000, retries: int = 2,
+        render_recheck_timeout_ms: int = 4_000,
+    ):
         self.timeout_ms = timeout_ms
         self.retries = retries
+        self.render_recheck_timeout_ms = max(0, render_recheck_timeout_ms)
 
     async def inspect_open_page(
         self, page: Page, original_url: str, started_at: float,
@@ -167,6 +182,13 @@ class BrowserLinkChecker:
                     expected_title=expected_title, status_by_url=status_by_url,
                     source_type=source_type,
                 )
+                result.inspection_url = original_url or page.url
+                if self._is_render_recheck_candidate(result):
+                    return await self._reinspect_after_render_wait(
+                        page, result, original_url, started_at, status_by_page,
+                        expected_title=expected_title, status_by_url=status_by_url,
+                        source_type=source_type,
+                    )
                 verdict = result.verdict
                 if verdict == "정상" or attempt == self.retries:
                     return result
@@ -187,7 +209,76 @@ class BrowserLinkChecker:
             response_seconds=round(time.perf_counter() - started_at, 3),
             error_message=last_error or decision.error,
             access_reason_code=decision.reason_code,
+            inspection_url=original_url or page.url,
         )
+
+    def _is_render_recheck_candidate(self, result: LinkCheckResult) -> bool:
+        status_allows_wait = result.http_status is None or result.http_status == 200
+        return (
+            self.render_recheck_timeout_ms > 0
+            and status_allows_wait
+            and result.verdict in {"빈화면", "확인필요"}
+            and result.final_url.startswith(("http://", "https://"))
+        )
+
+    async def _reinspect_after_render_wait(
+        self, page: Page, initial: LinkCheckResult, original_url: str,
+        started_at: float, status_by_page: dict[Page, int], *,
+        expected_title: str, status_by_url: dict[str, int] | None,
+        source_type: str,
+    ) -> LinkCheckResult:
+        wait_started = time.perf_counter()
+        await self._wait_for_render_signal(page, expected_title)
+        wait_seconds = round(time.perf_counter() - wait_started, 3)
+        try:
+            rechecked = await self.inspect_rendered_page(
+                page, original_url, started_at, status_by_page,
+                expected_title=expected_title, status_by_url=status_by_url,
+                source_type=source_type,
+            )
+        except Exception:
+            rechecked = initial
+
+        rechecked.inspection_url = original_url or page.url
+        rechecked.render_recheck_yn = "Y"
+        rechecked.initial_body_text_length = initial.body_text_length
+        rechecked.rechecked_body_text_length = rechecked.body_text_length
+        rechecked.initial_document_title = initial.document_title
+        rechecked.rechecked_document_title = rechecked.document_title
+        rechecked.initial_verdict = initial.verdict
+        rechecked.rechecked_verdict = rechecked.verdict
+        rechecked.render_recheck_wait_seconds = wait_seconds
+        return rechecked
+
+    async def _wait_for_render_signal(self, page: Page, expected_title: str) -> None:
+        deadline = time.perf_counter() + self.render_recheck_timeout_ms / 1000
+        while True:
+            remaining_ms = int((deadline - time.perf_counter()) * 1000)
+            if remaining_ms <= 0:
+                return
+            await page.wait_for_timeout(min(250, remaining_ms))
+            try:
+                body = await page.locator("body").inner_text(timeout=min(500, remaining_ms))
+                title = await page.title()
+                headings = await page.locator(
+                    "h1:visible, h2:visible, h3:visible, h4:visible, h5:visible, h6:visible"
+                ).all_inner_texts()
+                content_texts = await page.locator(
+                    f"{SPECIFIC_ARTICLE_SELECTOR}, article:visible, main:visible, [role='main']:visible"
+                ).all_inner_texts()
+            except Exception:
+                continue
+
+            body_length = len(re.sub(r"\s+", "", body or ""))
+            content_length = max(
+                [len(re.sub(r"\s+", "", text)) for text in content_texts] + [0]
+            )
+            if (
+                body_length >= 300
+                or article_title_matches(expected_title, [title, *headings])
+                or content_length >= 80
+            ):
+                return
 
     async def inspect_rendered_page(
         self, page: Page, original_url: str, started_at: float,
@@ -229,6 +320,7 @@ class BrowserLinkChecker:
             primary_components = [*headings, largest_generic]
         primary_text = "\n".join(text for text in primary_components if text)
         primary_text_length = len(re.sub(r"\s+", "", primary_text))
+        body_text_length = len(re.sub(r"\s+", "", body or ""))
         decision = classify_verdict_detailed(
             http_status=status, final_url=page.url, title=title, body_text=body,
             article_rendered=article_rendered,
@@ -246,7 +338,8 @@ class BrowserLinkChecker:
                     decision.detected_marker,
                 )
         return LinkCheckResult(
-            original_url=original_url or page.url, final_url=page.url,
+            original_url=original_url or page.url,
+            inspection_url=original_url or page.url, final_url=page.url,
             http_status=status, browser_result=decision.display,
             link_working_yn=working_yn(decision.verdict), verdict=decision.verdict,
             response_seconds=round(time.perf_counter() - started_at, 3),
@@ -267,6 +360,7 @@ class BrowserLinkChecker:
             matched_title=non_news_evidence.matched_title,
             content_container_locator=non_news_evidence.content_container_locator,
             attachment_exists_yn="Y" if non_news_evidence.attachment_exists else "N",
+            body_text_length=body_text_length,
         )
 
     async def open_url(
@@ -284,11 +378,13 @@ class BrowserLinkChecker:
                 )
                 if response:
                     status_by_page[page] = response.status
-                return await self.inspect_open_page(
+                result = await self.inspect_open_page(
                     page, url, started_at, status_by_page,
                     expected_title=expected_title, status_by_url=status_by_url,
                     source_type=source_type,
                 )
+                result.inspection_url = url
+                return result
             except PlaywrightTimeoutError:
                 last_error = f"{self.timeout_ms // 1000}초 내 응답 없음"
                 try:
@@ -298,6 +394,7 @@ class BrowserLinkChecker:
                         source_type=source_type,
                     )
                     if rendered.verdict in {"정상", "접근제한", "링크오류", "서버오류"}:
+                        rendered.inspection_url = url
                         return rendered
                 except Exception:
                     pass
@@ -311,7 +408,7 @@ class BrowserLinkChecker:
             title="", body_text="", timed_out=True,
         )
         return LinkCheckResult(
-            original_url=url, final_url=page.url,
+            original_url=url, inspection_url=url, final_url=page.url,
             http_status=status, browser_result=decision.display,
             link_working_yn=working_yn(decision.verdict), verdict=decision.verdict,
             response_seconds=round(time.perf_counter() - started_at, 3),

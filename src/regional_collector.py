@@ -21,7 +21,13 @@ from .link_checker import BrowserLinkChecker, LinkCheckResult
 from .logging_utils import debug_entry, sanitize
 from .models import AuditRow, SourceInfo
 from .source_parser import parse_source_text
-from .url_utils import analyze_url_structure, infer_external_url, normalize_url, resolve_url_reference
+from .url_utils import (
+    analyze_url_structure,
+    decode_html_url_entities,
+    infer_external_url,
+    normalize_url,
+    resolve_url_reference,
+)
 from .regions import REGION_DISPLAY_ORDER, validate_site_regions
 from .application.progress import (
     AuditCancelled,
@@ -74,11 +80,25 @@ class RegionalCollector:
         self._playwright: Playwright | None = None
         self._verification_sessions: dict[str, tuple[Browser, BrowserContext]] = {}
 
+    @staticmethod
+    def _desktop_chromium_user_agent(browser_version: str) -> str:
+        version = str(browser_version or "").strip()
+        if not version:
+            raise ValueError("Chromium 버전을 확인할 수 없습니다.")
+        return (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            f"Chrome/{version} Safari/537.36"
+        )
+
     async def run(self) -> tuple[list[AuditRow], list]:
         async with async_playwright() as playwright:
             self._playwright = playwright
             browser = await playwright.chromium.launch(headless=not self.headed)
-            context = await browser.new_context(locale="ko-KR")
+            context_options: dict[str, object] = {"locale": "ko-KR"}
+            if not self.headed:
+                context_options["user_agent"] = self._desktop_chromium_user_agent(browser.version)
+            context = await browser.new_context(**context_options)
             context.set_default_timeout(self.timeout_ms)
             self._track_navigation(context)
             page = await context.new_page()
@@ -596,6 +616,8 @@ class RegionalCollector:
                     click_target_raw=result.click_target_raw,
                     normalization_input=result.normalization_input,
                     original_url=result.original_url,
+                    inspection_url=result.inspection_url,
+                    url_html_entity_unescaped_yn=result.url_html_entity_unescaped_yn,
                     normalization_method=result.normalization_method,
                     click_before_url=result.click_before_url,
                     click_after_url=result.click_after_url,
@@ -627,6 +649,14 @@ class RegionalCollector:
                     matched_title=result.matched_title,
                     content_container_locator=result.content_container_locator,
                     attachment_exists_yn=result.attachment_exists_yn,
+                    render_recheck_yn=result.render_recheck_yn,
+                    initial_body_text_length=result.initial_body_text_length,
+                    rechecked_body_text_length=result.rechecked_body_text_length,
+                    initial_document_title=result.initial_document_title,
+                    rechecked_document_title=result.rechecked_document_title,
+                    initial_verdict=result.initial_verdict,
+                    rechecked_verdict=result.rechecked_verdict,
+                    render_recheck_wait_seconds=result.render_recheck_wait_seconds,
                 ))
                 self.logger.info("[%s][%s][이슈 %d] 출처 %d/%d %s", requested, region, issue_index + 1,
                                  source_order, len(sources), result.verdict)
@@ -645,6 +675,8 @@ class RegionalCollector:
                         "링크판정", requested, displayed, region=region,
                         issue_order=issue_index + 1, issue_title=issue["title"],
                         original_url=result.original_url, final_url=result.final_url,
+                        inspection_url=result.inspection_url,
+                        url_html_entity_unescaped_yn=result.url_html_entity_unescaped_yn,
                         http_status=result.http_status or "", event=result.verdict,
                         details=result.error_message, screenshot_path=result.screenshot_path,
                         access_reason_code=result.access_reason_code,
@@ -663,6 +695,14 @@ class RegionalCollector:
                         matched_title=result.matched_title,
                         content_container_locator=result.content_container_locator,
                         attachment_exists_yn=result.attachment_exists_yn,
+                        render_recheck_yn=result.render_recheck_yn,
+                        initial_body_text_length=result.initial_body_text_length,
+                        rechecked_body_text_length=result.rechecked_body_text_length,
+                        initial_document_title=result.initial_document_title,
+                        rechecked_document_title=result.rechecked_document_title,
+                        initial_verdict=result.initial_verdict,
+                        rechecked_verdict=result.rechecked_verdict,
+                        render_recheck_wait_seconds=result.render_recheck_wait_seconds,
                     )
                 await page.wait_for_timeout(self.link_delay_ms)
         finally:
@@ -754,10 +794,18 @@ class RegionalCollector:
                     captured_raw = await self._take_window_open_capture(source_page, capture_key)
                     raw_target = captured_raw or source_href_raw or inline_target
                     after_url = source_page.url
-                    resolved_target = await self._resolve_url_like_browser(
+                    resolved_clicked_url = await self._resolve_url_like_browser(
+                        source_page, after_url if after_url != before_url else "", before_url,
+                    )
+                    resolved_href_property = await self._resolve_url_like_browser(
+                        source_page, source_href_property, before_url,
+                    )
+                    resolved_captured_target = await self._resolve_url_like_browser(
                         source_page, raw_target, before_url,
                     )
-                    original_url = resolved_target or source_href_property
+                    original_url = (
+                        resolved_clicked_url or resolved_href_property or resolved_captured_target
+                    )
                     last_raw_target = raw_target
                     last_original_url = original_url
                     last_after_url = after_url if after_url != before_url else ""
@@ -775,7 +823,7 @@ class RegionalCollector:
                             source_href_property=source_href_property,
                             raw_target=raw_target, method="실제 클릭(현재 탭)",
                             click_target=click_target_label, click_before_url=before_url,
-                            click_after_url=after_url, first_opened_url=original_url,
+                            click_after_url=after_url, first_opened_url=after_url,
                             new_tab_yn="N", current_tab_moved_yn="Y",
                             source_type=source_type,
                         )
@@ -824,22 +872,55 @@ class RegionalCollector:
                 captured_raw = await self._take_window_open_capture(source_page, capture_key)
                 raw_target = captured_raw or source_href_raw or inline_target
                 click_after_url = target.url
-                resolved_target = await self._resolve_url_like_browser(
+                first_url = self.first_url_by_page.get(target, "")
+                opened_url = first_url or (
+                    target.url if target.url.startswith(("http://", "https://")) else ""
+                )
+                resolved_opened_url = await self._resolve_url_like_browser(
+                    source_page, opened_url, before_url,
+                )
+                resolved_current_url = await self._resolve_url_like_browser(
+                    source_page, target.url, before_url,
+                )
+                resolved_href_property = await self._resolve_url_like_browser(
+                    source_page, source_href_property, before_url,
+                )
+                resolved_captured_target = await self._resolve_url_like_browser(
                     source_page, raw_target, before_url,
                 )
-                first_url = self.first_url_by_page.get(target, "")
-                original_url = (
-                    resolved_target or first_url or source_href_property
-                    or (target.url if target.url.startswith(("http://", "https://")) else "")
+                observed_click_urls = {
+                    value for value in (resolved_href_property, resolved_captured_target) if value
+                }
+                first_url_is_initial_click = bool(
+                    resolved_opened_url
+                    and (
+                        resolved_opened_url != resolved_current_url
+                        or resolved_opened_url in observed_click_urls
+                        or not observed_click_urls
+                    )
                 )
+                original_url = (
+                    resolved_opened_url if first_url_is_initial_click else ""
+                ) or resolved_href_property or resolved_captured_target or resolved_opened_url
                 last_raw_target = raw_target
                 last_original_url = original_url
                 last_after_url = click_after_url
-                result = await checker.inspect_open_page(
-                    target, original_url or target.url, started, self.status_by_page,
-                    expected_title=expected_title, status_by_url=self.status_by_url,
-                    source_type=source_type,
+                opened_url_was_unescaped = bool(
+                    opened_url
+                    and decode_html_url_entities(opened_url) != str(opened_url).strip()
                 )
+                if opened_url_was_unescaped and original_url:
+                    result = await checker.open_url(
+                        target, original_url, started, self.status_by_page,
+                        expected_title=expected_title, status_by_url=self.status_by_url,
+                        source_type=source_type,
+                    )
+                else:
+                    result = await checker.inspect_open_page(
+                        target, original_url or target.url, started, self.status_by_page,
+                        expected_title=expected_title, status_by_url=self.status_by_url,
+                        source_type=source_type,
+                    )
                 result = await self._verify_automation_environment_block(
                     result, original_url or target.url, expected_title,
                     debug_context, started, source_type=source_type,
@@ -851,7 +932,7 @@ class RegionalCollector:
                     raw_target=raw_target, method="실제 클릭(새 탭)",
                     click_target=click_target_label, click_before_url=before_url,
                     click_after_url=click_after_url,
-                    first_opened_url=first_url or original_url,
+                    first_opened_url=first_url or opened_url,
                     new_tab_yn="Y", current_tab_moved_yn="N",
                 )
                 if result.verdict != "정상":
@@ -865,9 +946,13 @@ class RegionalCollector:
                     source_page, capture_key,
                 )
                 raw_target = captured_raw or source_href_raw or inline_target
-                original_url = await self._resolve_url_like_browser(
+                resolved_href_property = await self._resolve_url_like_browser(
+                    source_page, source_href_property, before_url,
+                )
+                resolved_captured_target = await self._resolve_url_like_browser(
                     source_page, raw_target, before_url,
-                ) or source_href_property
+                )
+                original_url = resolved_href_property or resolved_captured_target
                 last_raw_target = raw_target
                 last_original_url = original_url
                 if original_url and source_page.url == before_url:
@@ -977,6 +1062,15 @@ class RegionalCollector:
         result.current_tab_moved_yn = current_tab_moved_yn
         if original_url:
             result.original_url = original_url
+        result.inspection_url = result.inspection_url or result.final_url or result.original_url
+        raw_url_values = (
+            source_href_raw, source_href_property, raw_target,
+            click_after_url, first_opened_url,
+        )
+        result.url_html_entity_unescaped_yn = "Y" if any(
+            value and decode_html_url_entities(value) != str(value).strip()
+            for value in raw_url_values
+        ) else "N"
         structure = analyze_url_structure(result.original_url)
         result.url_structure_anomaly_yn = "Y" if structure.anomalous else "N"
         result.url_structure_anomaly_details = structure.details
@@ -1001,7 +1095,7 @@ class RegionalCollector:
 
     @staticmethod
     async def _resolve_url_like_browser(source_page: Page, value: str, base_url: str) -> str:
-        candidate = str(value or "").strip()
+        candidate = decode_html_url_entities(value)
         if not candidate:
             return ""
         try:
@@ -1009,7 +1103,7 @@ class RegionalCollector:
                 "([target, base]) => new URL(target, base).href", [candidate, base_url],
             )
         except Exception:
-            resolved = resolve_url_reference(candidate, base_url)
+            resolved = resolve_url_reference(value, base_url)
         return resolved if str(resolved).startswith(("http://", "https://")) else ""
 
     @staticmethod

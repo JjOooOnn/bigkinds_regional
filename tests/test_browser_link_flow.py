@@ -46,6 +46,21 @@ class _Handler(BaseHTTPRequestHandler):
             return
         routes = {
             "/article": (200, f"<title>{ARTICLE_TITLE}</title><h1>{ARTICLE_TITLE}</h1><p>{ARTICLE_BODY}</p>"),
+            "/article?ncd=1&amp;ref=DA": (
+                200, f"<title>{ARTICLE_TITLE}</title><h1>{ARTICLE_TITLE}</h1><p>{ARTICLE_BODY}</p>",
+            ),
+            "/article?ncd=1&ref=DA": (
+                200, f"<title>{ARTICLE_TITLE}</title><h1>{ARTICLE_TITLE}</h1><p>{ARTICLE_BODY}</p>",
+            ),
+            "/blank": (200, ""),
+            "/delayed-dom": (
+                200,
+                "<script>setTimeout(() => {"
+                f"document.title={ARTICLE_TITLE!r};"
+                f"document.body.innerHTML='<main><article><h1>{ARTICLE_TITLE}</h1>"
+                f"<p>{ARTICLE_BODY}</p></article></main>';"
+                "}, 1200);</script>",
+            ),
             "/article-comment-permission": (
                 200,
                 f"<title>{ARTICLE_TITLE}</title><h1>{ARTICLE_TITLE}</h1>"
@@ -91,6 +106,12 @@ class _Handler(BaseHTTPRequestHandler):
                 "</div></main>",
             ),
             "/source-popup": (200, "<div id='card' onclick=\"window.open('/article','_blank')\">popup</div>"),
+            "/source-entity-popup": (
+                200,
+                "<div id='card'>entity popup</div>"
+                "<script>document.getElementById('card').addEventListener('click', () => "
+                "window.open('/article?ncd=1&amp;ref=DA', '_blank'));</script>",
+            ),
             "/source-research": (
                 200,
                 "<div id='card' onclick=\"window.open('/research-attachment','_blank')\">research</div>",
@@ -139,6 +160,26 @@ class _Checkpoint:
 
     def add_debug(self, entry):
         self.debug_entries.append(entry)
+
+
+def test_headless_context_uses_desktop_chromium_user_agent():
+    user_agent = RegionalCollector._desktop_chromium_user_agent("149.0.7827.55")
+    assert "Chrome/149.0.7827.55" in user_agent
+    assert "HeadlessChrome" not in user_agent
+
+
+def test_browser_url_resolution_fallback_unescapes_entity_once():
+    async def scenario():
+        source_page = AsyncMock()
+        source_page.evaluate.side_effect = RuntimeError("page unavailable")
+        result = await RegionalCollector._resolve_url_like_browser(
+            source_page,
+            "https://example.com/article?x=1&amp;amp;ref=DA",
+            "https://www.bigkinds.or.kr/regional/curation.do",
+        )
+        assert result == "https://example.com/article?x=1&amp;ref=DA"
+
+    asyncio.run(scenario())
 
 
 def test_article_rendered_evidence_matches_changed_but_equivalent_title():
@@ -296,6 +337,7 @@ def test_local_browser_link_flows_and_verdicts():
                 return result
 
             popup = await activate("/source-popup")
+            entity_popup = await activate("/source-entity-popup")
             research_popup = await activate("/source-research", RESEARCH_TITLE, "연구보고서")
             current = await activate("/source-current")
             href = await activate("/source-href")
@@ -305,7 +347,7 @@ def test_local_browser_link_flows_and_verdicts():
             domain_href = await activate("/source-domain-href")
             fallback = await activate("/source-blocked-popup")
             missing = await activate("/source-none")
-            normal_results = [popup, current, href, absolute, redirect, fallback]
+            normal_results = [popup, entity_popup, current, href, absolute, redirect, fallback]
             assert [item.verdict for item in normal_results] == ["정상"] * len(normal_results)
             assert all(item.link_working_yn == "Y" for item in normal_results)
             assert all(item.http_status == 200 for item in normal_results)
@@ -315,6 +357,12 @@ def test_local_browser_link_flows_and_verdicts():
             assert popup.source_href_raw == ""
             assert popup.source_href_property == ""
             assert popup.click_target_raw == "/article"
+            assert entity_popup.click_target_raw == "/article?ncd=1&amp;ref=DA"
+            assert entity_popup.first_opened_url == base + "/article?ncd=1&amp;ref=DA"
+            assert entity_popup.original_url == base + "/article?ncd=1&ref=DA"
+            assert entity_popup.inspection_url == entity_popup.original_url
+            assert entity_popup.final_url == entity_popup.original_url
+            assert entity_popup.url_html_entity_unescaped_yn == "Y"
             assert href.source_href_raw == "/article"
             assert href.source_href_property == base + "/article"
             assert href.original_url == base + "/article"
@@ -363,8 +411,39 @@ def test_local_browser_link_flows_and_verdicts():
             assert "reply" in article_with_auxiliary_permission.detected_dom_area
             assert article_with_auxiliary_permission.article_exists_yn == "Y"
             assert article_with_auxiliary_permission.article_title_match_yn == "Y"
+            assert article_with_auxiliary_permission.render_recheck_yn == "N"
             assert forbidden.access_reason_code == "ACCESS_HTTP_STATUS"
             assert captcha.access_reason_code == "ACCESS_STRONG_TEXT_PRIMARY"
+
+            delayed_checker = BrowserLinkChecker(
+                timeout_ms=1_000, retries=0, render_recheck_timeout_ms=800,
+            )
+
+            async def inspect_delayed(path):
+                page = await context.new_page()
+                result = await delayed_checker.open_url(
+                    page, base + path, time.perf_counter(), {}, expected_title=ARTICLE_TITLE,
+                )
+                await page.close()
+                return result
+
+            delayed = await inspect_delayed("/delayed-dom")
+            blank = await inspect_delayed("/blank")
+            assert (delayed.verdict, delayed.link_working_yn) == ("정상", "Y")
+            assert delayed.render_recheck_yn == "Y"
+            assert delayed.initial_body_text_length == 0
+            assert delayed.rechecked_body_text_length >= 300
+            assert delayed.initial_document_title == ""
+            assert delayed.rechecked_document_title == ARTICLE_TITLE
+            assert delayed.initial_verdict == "빈화면"
+            assert delayed.rechecked_verdict == "정상"
+            assert 0 < delayed.render_recheck_wait_seconds <= 1.0
+            assert (blank.verdict, blank.link_working_yn) == ("빈화면", "N")
+            assert blank.render_recheck_yn == "Y"
+            assert blank.initial_body_text_length == 0
+            assert blank.rechecked_body_text_length == 0
+            assert blank.initial_verdict == blank.rechecked_verdict == "빈화면"
+            assert 0.7 <= blank.render_recheck_wait_seconds <= 1.0
 
             # 하위 광고 응답의 403은 context response 이벤트에 보이더라도
             # 메인 document 상태와 기사 판정을 덮어쓰면 안 된다.

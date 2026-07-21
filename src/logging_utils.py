@@ -53,9 +53,11 @@ def debug_entry(stage: str, **kwargs) -> DebugEntry:
         if key in {
             "details", "locator", "event", "source_href_raw", "source_href_property",
             "click_target_raw", "normalization_input", "original_url", "click_before_url",
-            "click_after_url", "first_opened_url", "inferred_url", "final_url",
+            "click_after_url", "first_opened_url", "inferred_url", "final_url", "inspection_url",
             "access_reason_code", "detected_phrase", "detected_locator", "detected_dom_area",
             "document_title", "visible_h1", "matched_title", "content_container_locator",
+            "initial_document_title", "rechecked_document_title", "initial_verdict",
+            "rechecked_verdict",
         }
         else value
         for key, value in kwargs.items()

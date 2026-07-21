@@ -4,6 +4,7 @@ from src.url_utils import (
     INTERNAL_RELATIVE_PATH,
     PROTOCOL_RELATIVE,
     analyze_url_structure,
+    decode_html_url_entities,
     infer_external_url,
     is_suspicious_embedded_external_url,
     normalize_url,
@@ -75,6 +76,15 @@ def test_html_entity_and_whitespace_are_the_only_text_cleanup():
         "  /news?a=1&amp;b=2  ", "https://www.bigkinds.or.kr/regional/curation.do",
     )
     assert result == "https://www.bigkinds.or.kr/news?a=1&b=2"
+
+
+def test_html_url_entity_is_unescaped_exactly_once():
+    assert decode_html_url_entities("https://example.com/a?x=1&amp;y=2") == (
+        "https://example.com/a?x=1&y=2"
+    )
+    assert decode_html_url_entities("https://example.com/a?x=1&amp;amp;y=2") == (
+        "https://example.com/a?x=1&amp;y=2"
+    )
 
 
 def test_bigkinds_path_with_embedded_external_domain_is_suspicious():

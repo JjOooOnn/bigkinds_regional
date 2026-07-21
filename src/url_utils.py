@@ -92,13 +92,18 @@ def _canonicalize_http_url(absolute: str, *, keep_fragment: bool = False) -> str
     return urlunsplit((scheme, netloc, parts.path or "", parts.query, fragment))
 
 
+def decode_html_url_entities(url: str) -> str:
+    """URL 입력 경계에서 HTML 엔티티를 정확히 한 번 해제한다."""
+    return unescape(str(url or "")).strip()
+
+
 def resolve_url_reference(url: str, base_url: str) -> str:
     """브라우저의 ``new URL(value, base)``와 같은 상대 URL 해석만 수행한다.
 
     도메인처럼 보이는 상대 문자열에도 스킴을 추정해 붙이지 않는다. 예를 들어
     ``www.example.com/a``는 현재 문서 경로 아래의 상대 URL로 유지된다.
     """
-    value = unescape(str(url or "")).strip()
+    value = decode_html_url_entities(url)
     base = str(base_url or "").strip()
     if not value or not base:
         return ""
@@ -110,7 +115,7 @@ def normalize_url_with_method(
     url: str, base_url: str | None = None, *, allow_internal_relative: bool = True,
 ) -> NormalizedUrl:
     raw = str(url or "")
-    value = unescape(raw).strip()
+    value = decode_html_url_entities(raw)
     if not value:
         return NormalizedUrl("", "", value)
 
@@ -135,7 +140,7 @@ def normalize_url(url: str, base_url: str | None = None) -> str:
 
 def infer_external_url(url: str) -> str:
     """프로토콜 없는 도메인형 문자열의 추정 URL을 진단용으로만 만든다."""
-    value = unescape(str(url or "")).strip()
+    value = decode_html_url_entities(url)
     if not looks_like_domain_reference(value):
         return ""
     return _canonicalize_http_url(f"https://{value}", keep_fragment=True)

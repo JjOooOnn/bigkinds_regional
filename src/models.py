@@ -61,6 +61,8 @@ class DebugEntry:
     click_target_raw: str = ""
     normalization_input: str = ""
     original_url: str = ""
+    inspection_url: str = ""
+    url_html_entity_unescaped_yn: str = ""
     normalization_method: str = ""
     click_before_url: str = ""
     click_after_url: str = ""
@@ -94,6 +96,14 @@ class DebugEntry:
     matched_title: str = ""
     content_container_locator: str = ""
     attachment_exists_yn: str = ""
+    render_recheck_yn: str = ""
+    initial_body_text_length: int | str = ""
+    rechecked_body_text_length: int | str = ""
+    initial_document_title: str = ""
+    rechecked_document_title: str = ""
+    initial_verdict: str = ""
+    rechecked_verdict: str = ""
+    render_recheck_wait_seconds: float | str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
