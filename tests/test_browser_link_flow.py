@@ -15,6 +15,9 @@ from src.verdict import classify_verdict
 
 ARTICLE_TITLE = "지역 현안 정상 기사 제목"
 ARTICLE_BODY = "실제 Chromium에 표시되는 정상적인 기사 본문입니다. " * 30
+RESEARCH_TITLE = "[제73호] 지역통합과 정부 메가프로젝트 연계 전략"
+NOTICE_TITLE = "2026년 지역정책 연구지원 사업 공고"
+NOTICE_BODY = "지역정책 연구지원 사업의 신청 대상과 제출 방법을 안내하는 공지사항 본문입니다. " * 12
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -63,7 +66,35 @@ class _Handler(BaseHTTPRequestHandler):
             "/403": (403, "<title>Access Denied</title><h1>Access Denied</h1>"),
             "/login": (200, "<title>로그인</title><h1>로그인</h1><p>기사를 보려면 로그인이 필요합니다.</p>"),
             "/captcha": (200, "<title>CAPTCHA</title><main><h1>CAPTCHA</h1><p>Robot check CAPTCHA</p></main>"),
+            "/research-attachment": (
+                200,
+                f"<title>{RESEARCH_TITLE} | 연구원</title><main><section class='report-detail'>"
+                f"<h3 class='report-title'>{RESEARCH_TITLE}</h3>"
+                "<table><tbody><tr><td>연구책임자: 홍길동</td></tr><tr><td>첨부파일: "
+                "<a href=\"javascript:file_download('/download?id=1', 'report.pdf')\" "
+                "title='report.pdf 다운로드'><span>report.pdf</span></a></td></tr></tbody></table>"
+                "</section></main>",
+            ),
+            "/notice-detail": (
+                200,
+                f"<title>{NOTICE_TITLE}</title><main><div class='board-detail'>"
+                f"<div id='board-title'>{NOTICE_TITLE}</div>"
+                f"<table><tbody><tr><td class='view-content'>{NOTICE_BODY}</td></tr></tbody></table>"
+                "</div></main>",
+            ),
+            "/notice-comment-permission": (
+                200,
+                f"<title>{NOTICE_TITLE}</title><main><div class='board-detail'>"
+                f"<div class='view-title'>{NOTICE_TITLE}</div>"
+                f"<div class='view-content'>{NOTICE_BODY}</div>"
+                "<section class='comment-reply'><span>댓글입력 권한이 없습니다.</span></section>"
+                "</div></main>",
+            ),
             "/source-popup": (200, "<div id='card' onclick=\"window.open('/article','_blank')\">popup</div>"),
+            "/source-research": (
+                200,
+                "<div id='card' onclick=\"window.open('/research-attachment','_blank')\">research</div>",
+            ),
             "/source-current": (200, "<div id='card' onclick=\"location.href='/article'\">current</div>"),
             "/source-href": (200, "<div id='card'><a href='/article' target='_blank'>href</a></div>"),
             "/source-absolute-href": (
@@ -160,6 +191,74 @@ def test_source_cards_use_structure_instead_of_source_type_allowlist():
     asyncio.run(scenario())
 
 
+def test_non_news_detail_fallback_preserves_news_and_http_errors():
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+
+    async def scenario():
+        checker = BrowserLinkChecker(timeout_ms=1_000, retries=0)
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            context = await browser.new_context(locale="ko-KR")
+
+            async def inspect(path, expected_title, source_type):
+                page = await context.new_page()
+                result = await checker.open_url(
+                    page, base + path, time.perf_counter(), {},
+                    expected_title=expected_title, source_type=source_type,
+                )
+                await page.close()
+                return result
+
+            research = await inspect("/research-attachment", RESEARCH_TITLE, "연구보고서")
+            notice = await inspect("/notice-detail", NOTICE_TITLE, "공지사항")
+            notice_with_comment = await inspect(
+                "/notice-comment-permission", NOTICE_TITLE, "공지사항",
+            )
+            news = await inspect("/article", ARTICLE_TITLE, "뉴스")
+            not_found = await inspect("/404", RESEARCH_TITLE, "연구보고서")
+            forbidden = await inspect("/403", RESEARCH_TITLE, "연구보고서")
+            full_login = await inspect("/login", NOTICE_TITLE, "공지사항")
+
+            assert (research.verdict, research.link_working_yn) == ("정상", "Y")
+            assert research.access_reason_code == "NON_NEWS_DETAIL_RENDERED"
+            assert research.article_rendered_yn == "N"
+            assert research.non_news_title_match_yn == "Y"
+            assert research.non_news_content_rendered_yn == "Y"
+            assert research.attachment_exists_yn == "Y"
+            assert research.matched_title == RESEARCH_TITLE
+            assert research.content_container_locator
+
+            assert (notice.verdict, notice.link_working_yn) == ("정상", "Y")
+            assert notice.access_reason_code == "NON_NEWS_DETAIL_RENDERED"
+            assert notice.attachment_exists_yn == "N"
+            assert notice.non_news_content_rendered_yn == "Y"
+
+            assert (notice_with_comment.verdict, notice_with_comment.link_working_yn) == ("정상", "Y")
+            assert notice_with_comment.access_reason_code == "NON_NEWS_DETAIL_RENDERED"
+            assert notice_with_comment.detected_phrase == "댓글입력 권한이 없습니다."
+            assert "comment" in notice_with_comment.detected_dom_area
+
+            assert (news.verdict, news.link_working_yn, news.article_rendered_yn) == ("정상", "Y", "Y")
+            assert news.non_news_content_rendered_yn == "N"
+            assert not_found.verdict == "링크오류" and not_found.link_working_yn == "N"
+            assert forbidden.verdict == "접근제한" and forbidden.link_working_yn == "N"
+            assert forbidden.access_reason_code == "ACCESS_HTTP_STATUS"
+            assert full_login.verdict == "접근제한" and full_login.link_working_yn == "N"
+
+            await context.close()
+            await browser.close()
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
 def test_local_browser_link_flows_and_verdicts():
     server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
     thread = Thread(target=server.serve_forever, daemon=True)
@@ -185,17 +284,19 @@ def test_local_browser_link_flows_and_verdicts():
             context.set_default_timeout(1_000)
             collector._track_navigation(context)
 
-            async def activate(path):
+            async def activate(path, expected_title=ARTICLE_TITLE, source_type=""):
                 source = await context.new_page()
                 await source.goto(base + path, wait_until="domcontentloaded")
                 result = await collector._click_and_check(
                     context, source, source.locator("#card"), checker,
-                    expected_title=ARTICLE_TITLE, debug_context=debug_context,
+                    expected_title=expected_title, debug_context=debug_context,
+                    source_type=source_type,
                 )
                 await source.close()
                 return result
 
             popup = await activate("/source-popup")
+            research_popup = await activate("/source-research", RESEARCH_TITLE, "연구보고서")
             current = await activate("/source-current")
             href = await activate("/source-href")
             absolute = await activate("/source-absolute-href")
@@ -208,6 +309,8 @@ def test_local_browser_link_flows_and_verdicts():
             assert [item.verdict for item in normal_results] == ["정상"] * len(normal_results)
             assert all(item.link_working_yn == "Y" for item in normal_results)
             assert all(item.http_status == 200 for item in normal_results)
+            assert (research_popup.verdict, research_popup.link_working_yn) == ("정상", "Y")
+            assert research_popup.access_reason_code == "NON_NEWS_DETAIL_RENDERED"
             assert fallback.original_url == base + "/article"
             assert popup.source_href_raw == ""
             assert popup.source_href_property == ""

@@ -189,7 +189,7 @@ class RegionalCollector:
 
     async def _verify_automation_environment_block(
         self, primary: LinkCheckResult, url: str, expected_title: str,
-        debug_context: dict, started_at: float,
+        debug_context: dict, started_at: float, source_type: str = "",
     ) -> LinkCheckResult:
         """headless 메인 문서만 403인 경우 headed 브라우저의 실제 DOM을 재확인한다."""
         should_verify = (
@@ -211,6 +211,7 @@ class RegionalCollector:
                 verifier = BrowserLinkChecker(self.timeout_ms, retries=0)
                 verified = await verifier.open_url(
                     page, url, started_at, {}, expected_title=expected_title,
+                    source_type=source_type,
                 )
                 attempts.append(
                     f"{environment}: main_status={verified.http_status}, "
@@ -239,6 +240,11 @@ class RegionalCollector:
                     primary_text_length=verified.primary_text_length,
                     article_title_match_yn=verified.article_title_match_yn,
                     article_rendered_yn=verified.article_rendered_yn,
+                    non_news_title_match_yn=verified.non_news_title_match_yn,
+                    non_news_content_rendered_yn=verified.non_news_content_rendered_yn,
+                    matched_title=verified.matched_title,
+                    content_container_locator=verified.content_container_locator,
+                    attachment_exists_yn=verified.attachment_exists_yn,
                 ))
                 self.logger.info(
                     "자동화 환경 차단 확인: headless HTTP %s, %s HTTP %s, 기사 DOM 정상",
@@ -267,6 +273,11 @@ class RegionalCollector:
             primary_text_length=primary.primary_text_length,
             article_title_match_yn=primary.article_title_match_yn,
             article_rendered_yn=primary.article_rendered_yn,
+            non_news_title_match_yn=primary.non_news_title_match_yn,
+            non_news_content_rendered_yn=primary.non_news_content_rendered_yn,
+            matched_title=primary.matched_title,
+            content_container_locator=primary.content_container_locator,
+            attachment_exists_yn=primary.attachment_exists_yn,
         ))
         return primary
 
@@ -558,6 +569,7 @@ class RegionalCollector:
                 result = await self._click_and_check(
                     context, page, source_card, checker,
                     expected_title=source_info.title, debug_context=link_context,
+                    source_type=source_info.source_type,
                 )
                 row = AuditRow(
                     requested_date=requested.isoformat(), displayed_date=displayed.isoformat() if displayed else "",
@@ -610,6 +622,11 @@ class RegionalCollector:
                     primary_text_length=result.primary_text_length,
                     article_title_match_yn=result.article_title_match_yn,
                     article_rendered_yn=result.article_rendered_yn,
+                    non_news_title_match_yn=result.non_news_title_match_yn,
+                    non_news_content_rendered_yn=result.non_news_content_rendered_yn,
+                    matched_title=result.matched_title,
+                    content_container_locator=result.content_container_locator,
+                    attachment_exists_yn=result.attachment_exists_yn,
                 ))
                 self.logger.info("[%s][%s][이슈 %d] 출처 %d/%d %s", requested, region, issue_index + 1,
                                  source_order, len(sources), result.verdict)
@@ -641,6 +658,11 @@ class RegionalCollector:
                         primary_text_length=result.primary_text_length,
                         article_title_match_yn=result.article_title_match_yn,
                         article_rendered_yn=result.article_rendered_yn,
+                        non_news_title_match_yn=result.non_news_title_match_yn,
+                        non_news_content_rendered_yn=result.non_news_content_rendered_yn,
+                        matched_title=result.matched_title,
+                        content_container_locator=result.content_container_locator,
+                        attachment_exists_yn=result.attachment_exists_yn,
                     )
                 await page.wait_for_timeout(self.link_delay_ms)
         finally:
@@ -697,7 +719,7 @@ class RegionalCollector:
 
     async def _click_and_check(
         self, context: BrowserContext, source_page: Page, source_card: Locator, checker: BrowserLinkChecker,
-        *, expected_title: str, debug_context: dict,
+        *, expected_title: str, debug_context: dict, source_type: str = "",
     ) -> LinkCheckResult:
         """BigKinds 출처 카드를 실제 클릭하고 그 클릭이 연 URL만 판정한다.
 
@@ -755,6 +777,7 @@ class RegionalCollector:
                             click_target=click_target_label, click_before_url=before_url,
                             click_after_url=after_url, first_opened_url=original_url,
                             new_tab_yn="N", current_tab_moved_yn="Y",
+                            source_type=source_type,
                         )
 
                     if original_url:
@@ -781,6 +804,7 @@ class RegionalCollector:
                             click_target=click_target_label, click_before_url=before_url,
                             click_after_url="", first_opened_url=original_url,
                             new_tab_yn="N", current_tab_moved_yn="N",
+                            source_type=source_type,
                         )
 
                     if attempt < self.retries:
@@ -814,10 +838,11 @@ class RegionalCollector:
                 result = await checker.inspect_open_page(
                     target, original_url or target.url, started, self.status_by_page,
                     expected_title=expected_title, status_by_url=self.status_by_url,
+                    source_type=source_type,
                 )
                 result = await self._verify_automation_environment_block(
                     result, original_url or target.url, expected_title,
-                    debug_context, started,
+                    debug_context, started, source_type=source_type,
                 )
                 self._attach_url_diagnostics(
                     result, original_url=original_url or result.original_url,
@@ -856,6 +881,7 @@ class RegionalCollector:
                         click_target=click_target_label, click_before_url=before_url,
                         click_after_url="", first_opened_url=original_url,
                         new_tab_yn="N", current_tab_moved_yn="N",
+                        source_type=source_type,
                     )
                 if attempt < self.retries:
                     self.checkpoint.add_debug(debug_entry(
@@ -897,7 +923,8 @@ class RegionalCollector:
         *, expected_title: str, debug_context: dict, source_href_raw: str,
         source_href_property: str, raw_target: str, method: str, click_target: str,
         click_before_url: str, click_after_url: str, first_opened_url: str,
-        new_tab_yn: str, current_tab_moved_yn: str, started: float | None = None,
+        new_tab_yn: str, current_tab_moved_yn: str, source_type: str = "",
+        started: float | None = None,
     ) -> LinkCheckResult:
         target = await context.new_page()
         started = started if started is not None else time.perf_counter()
@@ -905,9 +932,11 @@ class RegionalCollector:
             result = await checker.open_url(
                 target, original_url, started, self.status_by_page,
                 expected_title=expected_title, status_by_url=self.status_by_url,
+                source_type=source_type,
             )
             result = await self._verify_automation_environment_block(
                 result, original_url, expected_title, debug_context, started,
+                source_type=source_type,
             )
             self._attach_url_diagnostics(
                 result, original_url=original_url,

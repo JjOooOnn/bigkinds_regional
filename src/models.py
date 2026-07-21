@@ -89,6 +89,11 @@ class DebugEntry:
     primary_text_length: int | str = ""
     article_title_match_yn: str = ""
     article_rendered_yn: str = ""
+    non_news_title_match_yn: str = ""
+    non_news_content_rendered_yn: str = ""
+    matched_title: str = ""
+    content_container_locator: str = ""
+    attachment_exists_yn: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

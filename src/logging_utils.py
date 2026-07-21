@@ -55,7 +55,7 @@ def debug_entry(stage: str, **kwargs) -> DebugEntry:
             "click_target_raw", "normalization_input", "original_url", "click_before_url",
             "click_after_url", "first_opened_url", "inferred_url", "final_url",
             "access_reason_code", "detected_phrase", "detected_locator", "detected_dom_area",
-            "document_title", "visible_h1",
+            "document_title", "visible_h1", "matched_title", "content_container_locator",
         }
         else value
         for key, value in kwargs.items()

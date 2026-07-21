@@ -12,6 +12,7 @@ from .url_utils import normalize_url
 from .verdict import (
     LOGIN_REQUIRED_MARKERS,
     STRONG_BLOCK_MARKERS,
+    VerdictDecision,
     classify_verdict_detailed,
     working_yn,
 )
@@ -23,6 +24,23 @@ SPECIFIC_ARTICLE_SELECTOR = (
     "#article-view-content-div:visible, .news_body:visible"
 )
 GENERIC_ARTICLE_SELECTOR = "article:visible"
+NON_NEWS_TITLE_SELECTOR = (
+    "h1, h2, h3, h4, h5, h6, "
+    "[class*='title' i], [id*='title' i], "
+    "[class*='subject' i], [id*='subject' i], "
+    "[class*='heading' i], [id*='heading' i], "
+    "[class*='view-title' i], [id*='view-title' i], "
+    "[class*='board-title' i], [id*='board-title' i], "
+    "[class*='report-title' i], [id*='report-title' i], "
+    "[class*='tit' i], [id*='tit' i], "
+    "table[summary*='상세'] thead th, main thead th, [role='main'] thead th, "
+    "#content thead th, .content thead th"
+)
+TEXT_ACCESS_REASON_CODES = {
+    "ACCESS_STRONG_TEXT_PRIMARY",
+    "ACCESS_STRONG_TEXT_NO_ARTICLE",
+    "ACCESS_LOGIN_REQUIRED_NO_ARTICLE",
+}
 
 
 @dataclass
@@ -61,6 +79,21 @@ class LinkCheckResult:
     primary_text_length: int = 0
     article_title_match_yn: str = "N"
     article_rendered_yn: str = "N"
+    non_news_title_match_yn: str = "N"
+    non_news_content_rendered_yn: str = "N"
+    matched_title: str = ""
+    content_container_locator: str = ""
+    attachment_exists_yn: str = "N"
+
+
+@dataclass(frozen=True)
+class NonNewsDetailEvidence:
+    title_match: bool = False
+    content_rendered: bool = False
+    matched_title: str = ""
+    content_container_locator: str = ""
+    content_text_length: int = 0
+    attachment_exists: bool = False
 
 
 def _normalized_title(value: str) -> str:
@@ -118,6 +151,7 @@ class BrowserLinkChecker:
         self, page: Page, original_url: str, started_at: float,
         status_by_page: dict[Page, int], expected_title: str = "",
         status_by_url: dict[str, int] | None = None,
+        source_type: str = "",
     ) -> LinkCheckResult:
         timed_out = False
         last_error = ""
@@ -131,6 +165,7 @@ class BrowserLinkChecker:
                 result = await self.inspect_rendered_page(
                     page, original_url, started_at, status_by_page,
                     expected_title=expected_title, status_by_url=status_by_url,
+                    source_type=source_type,
                 )
                 verdict = result.verdict
                 if verdict == "정상" or attempt == self.retries:
@@ -158,6 +193,7 @@ class BrowserLinkChecker:
         self, page: Page, original_url: str, started_at: float,
         status_by_page: dict[Page, int], expected_title: str = "",
         status_by_url: dict[str, int] | None = None,
+        source_type: str = "",
     ) -> LinkCheckResult:
         """추가 navigation 대기 없이 현재 Chromium 화면 자체를 판정한다."""
         title = await page.title()
@@ -199,6 +235,16 @@ class BrowserLinkChecker:
             primary_text=primary_text,
         )
         marker_evidence = await self._locate_marker(page, decision.detected_marker)
+        non_news_evidence = NonNewsDetailEvidence()
+        if self._should_inspect_non_news_detail(
+            source_type, status, decision, marker_evidence,
+        ):
+            non_news_evidence = await self._inspect_non_news_detail(page, expected_title)
+            if non_news_evidence.content_rendered:
+                decision = VerdictDecision(
+                    "정상", "정상 표시", "", "NON_NEWS_DETAIL_RENDERED",
+                    decision.detected_marker,
+                )
         return LinkCheckResult(
             original_url=original_url or page.url, final_url=page.url,
             http_status=status, browser_result=decision.display,
@@ -216,12 +262,18 @@ class BrowserLinkChecker:
             primary_text_length=primary_text_length,
             article_title_match_yn="Y" if title_matches else "N",
             article_rendered_yn="Y" if article_rendered else "N",
+            non_news_title_match_yn="Y" if non_news_evidence.title_match else "N",
+            non_news_content_rendered_yn="Y" if non_news_evidence.content_rendered else "N",
+            matched_title=non_news_evidence.matched_title,
+            content_container_locator=non_news_evidence.content_container_locator,
+            attachment_exists_yn="Y" if non_news_evidence.attachment_exists else "N",
         )
 
     async def open_url(
         self, page: Page, url: str, started_at: float,
         status_by_page: dict[Page, int], expected_title: str = "",
         status_by_url: dict[str, int] | None = None,
+        source_type: str = "",
     ) -> LinkCheckResult:
         """검사 전용 page 이동을 재시도하고, timeout 때도 렌더링 결과를 우선한다."""
         last_error = ""
@@ -235,6 +287,7 @@ class BrowserLinkChecker:
                 return await self.inspect_open_page(
                     page, url, started_at, status_by_page,
                     expected_title=expected_title, status_by_url=status_by_url,
+                    source_type=source_type,
                 )
             except PlaywrightTimeoutError:
                 last_error = f"{self.timeout_ms // 1000}초 내 응답 없음"
@@ -242,6 +295,7 @@ class BrowserLinkChecker:
                     rendered = await self.inspect_rendered_page(
                         page, url, started_at, status_by_page,
                         expected_title=expected_title, status_by_url=status_by_url,
+                        source_type=source_type,
                     )
                     if rendered.verdict in {"정상", "접근제한", "링크오류", "서버오류"}:
                         return rendered
@@ -266,11 +320,239 @@ class BrowserLinkChecker:
         )
 
     @staticmethod
+    def _should_inspect_non_news_detail(
+        source_type: str, status: int | None, decision: VerdictDecision,
+        marker_evidence: dict[str, str],
+    ) -> bool:
+        normalized_type = (source_type or "").strip()
+        if not normalized_type or normalized_type == "뉴스":
+            return False
+        if status is not None and status >= 400:
+            return False
+        if decision.verdict == "확인필요":
+            return True
+        return (
+            decision.verdict == "접근제한"
+            and decision.reason_code in TEXT_ACCESS_REASON_CODES
+            and marker_evidence.get("auxiliary_yn") == "Y"
+        )
+
+    @staticmethod
+    async def _inspect_non_news_detail(
+        page: Page, expected_title: str,
+    ) -> NonNewsDetailEvidence:
+        if not expected_title:
+            return NonNewsDetailEvidence()
+
+        candidate_data = await page.evaluate(
+            r"""({selector, expectedLength}) => {
+                const visible = element => {
+                    const style = getComputedStyle(element);
+                    const rect = element.getBoundingClientRect();
+                    return style.display !== 'none' && style.visibility !== 'hidden' &&
+                        style.opacity !== '0' && rect.width > 0 && rect.height > 0;
+                };
+                const label = element => [
+                    element.id || '',
+                    typeof element.className === 'string' ? element.className : '',
+                    element.getAttribute('role') || '',
+                    element.getAttribute('aria-label') || '',
+                ].join(' ').trim();
+                const auxiliary = element => {
+                    for (let node = element; node && node.nodeType === 1; node = node.parentElement) {
+                        if (['HEADER', 'NAV', 'FOOTER', 'ASIDE', 'LI'].includes(node.tagName)) return true;
+                        const value = label(node);
+                        const detailLike = /detail|view|board|bbs|report|post|content|write/i.test(value);
+                        if (/comment|reply|share|social|subscribe|subscription|advert|related|prev|next|bookmark|favorite|banner|hero|carousel|slider/i.test(value)) return true;
+                        if (!detailLike && /(?:^|[\s_-])(list|search|result|menu|item)(?:$|[\s_-])/i.test(value)) return true;
+                    }
+                    return false;
+                };
+                const path = element => {
+                    const parts = [];
+                    for (let node = element; node && node.nodeType === 1 && parts.length < 10; node = node.parentElement) {
+                        let part = node.tagName.toLowerCase();
+                        if (node.id) {
+                            part += '#' + CSS.escape(node.id);
+                            parts.unshift(part);
+                            break;
+                        }
+                        const siblings = node.parentElement
+                            ? [...node.parentElement.children].filter(value => value.tagName === node.tagName)
+                            : [];
+                        if (siblings.length > 1) part += `:nth-of-type(${siblings.indexOf(node) + 1})`;
+                        parts.unshift(part);
+                    }
+                    return parts.join(' > ');
+                };
+                const minimumLength = Math.min(8, Math.max(4, expectedLength));
+                const candidates = [...document.querySelectorAll(selector)].flatMap(element => {
+                    if (!visible(element) || auxiliary(element)) return [];
+                    const text = (element.innerText || '').replace(/\s+/g, ' ').trim();
+                    const compactLength = text.replace(/\s+/g, '').length;
+                    if (compactLength < minimumLength || compactLength > 300) return [];
+                    return [{
+                        text,
+                        tag: element.tagName,
+                        label: label(element),
+                        locator: path(element),
+                    }];
+                });
+                return {
+                    documentTitle: document.title || '',
+                    ogTitle: document.querySelector('meta[property="og:title"]')?.content || '',
+                    twitterTitle: document.querySelector('meta[name="twitter:title"]')?.content || '',
+                    candidates,
+                };
+            }""",
+            {
+                "selector": NON_NEWS_TITLE_SELECTOR,
+                "expectedLength": len(_normalized_title(expected_title)),
+            },
+        )
+        metadata_titles = [
+            candidate_data.get("documentTitle", ""),
+            candidate_data.get("ogTitle", ""),
+            candidate_data.get("twitterTitle", ""),
+        ]
+        metadata_match = article_title_matches(expected_title, metadata_titles)
+        matching = [
+            candidate for candidate in candidate_data.get("candidates", [])
+            if article_title_matches(expected_title, [candidate.get("text", "")])
+        ]
+        if not matching:
+            matched_metadata = next(
+                (value for value in metadata_titles if article_title_matches(expected_title, [value])),
+                "",
+            )
+            return NonNewsDetailEvidence(
+                title_match=metadata_match,
+                matched_title=matched_metadata,
+            )
+
+        expected_length = len(_normalized_title(expected_title))
+        tag_priority = {f"H{level}": level for level in range(1, 7)}
+        tag_priority["TH"] = 7
+        matching.sort(key=lambda candidate: (
+            abs(len(_normalized_title(candidate.get("text", ""))) - expected_length),
+            tag_priority.get(candidate.get("tag", ""), 8),
+            len(candidate.get("text", "")),
+        ))
+        matched = matching[0]
+        container = await page.evaluate(
+            r"""({titleLocator, titleText}) => {
+                const title = document.querySelector(titleLocator);
+                if (!title) return {};
+                const visible = element => {
+                    const style = getComputedStyle(element);
+                    const rect = element.getBoundingClientRect();
+                    return style.display !== 'none' && style.visibility !== 'hidden' &&
+                        style.opacity !== '0' && rect.width > 0 && rect.height > 0;
+                };
+                const label = element => [
+                    element.id || '',
+                    typeof element.className === 'string' ? element.className : '',
+                    element.getAttribute('role') || '',
+                    element.getAttribute('aria-label') || '',
+                ].join(' ').trim();
+                const auxiliaryNode = element => {
+                    if (['HEADER', 'NAV', 'FOOTER', 'ASIDE', 'LI'].includes(element.tagName)) return true;
+                    const value = label(element);
+                    const detailLike = /detail|view|board|bbs|report|post|content|write/i.test(value);
+                    if (/comment|reply|share|social|subscribe|subscription|advert|related|prev|next|bookmark|favorite|banner|hero|carousel|slider/i.test(value)) return true;
+                    return !detailLike && /(?:^|[\s_-])(list|search|result|menu|item)(?:$|[\s_-])/i.test(value);
+                };
+                const path = element => {
+                    const parts = [];
+                    for (let node = element; node && node.nodeType === 1 && parts.length < 10; node = node.parentElement) {
+                        let part = node.tagName.toLowerCase();
+                        if (node.id) {
+                            part += '#' + CSS.escape(node.id);
+                            parts.unshift(part);
+                            break;
+                        }
+                        const siblings = node.parentElement
+                            ? [...node.parentElement.children].filter(value => value.tagName === node.tagName)
+                            : [];
+                        if (siblings.length > 1) part += `:nth-of-type(${siblings.indexOf(node) + 1})`;
+                        parts.unshift(part);
+                    }
+                    return parts.join(' > ');
+                };
+                const attachmentLinks = root => [...root.querySelectorAll('a[href]')].filter(anchor => {
+                    if (!visible(anchor)) return false;
+                    const value = [
+                        anchor.getAttribute('href') || '',
+                        anchor.getAttribute('download') || '',
+                        anchor.getAttribute('title') || '',
+                        anchor.innerText || '',
+                    ].join(' ');
+                    return anchor.hasAttribute('download') ||
+                        /\.(pdf|hwp|hwpx|doc|docx|xls|xlsx|ppt|pptx|zip)\b/i.test(value);
+                });
+                const contentText = root => {
+                    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+                    const values = [];
+                    while (walker.nextNode()) {
+                        const textNode = walker.currentNode;
+                        const parent = textNode.parentElement;
+                        if (!parent || !visible(parent) || title.contains(parent)) continue;
+                        if (['SCRIPT', 'STYLE', 'NOSCRIPT', 'A', 'BUTTON', 'INPUT', 'SELECT', 'TEXTAREA', 'LABEL'].includes(parent.tagName)) continue;
+                        let excluded = false;
+                        for (let node = parent; node && node !== root; node = node.parentElement) {
+                            if (auxiliaryNode(node)) {
+                                excluded = true;
+                                break;
+                            }
+                        }
+                        if (!excluded) values.push(textNode.nodeValue || '');
+                    }
+                    const normalized = values.join(' ').replace(/\s+/g, ' ').trim();
+                    const withoutTitle = normalized.replace(titleText, '').trim();
+                    return {
+                        text: withoutTitle,
+                        length: withoutTitle.replace(/\s+/g, '').length,
+                    };
+                };
+
+                let depth = 0;
+                for (let node = title.parentElement; node && node.nodeType === 1; node = node.parentElement) {
+                    if (['BODY', 'HTML'].includes(node.tagName) || depth++ > 8) break;
+                    if (auxiliaryNode(node)) continue;
+                    const attachments = attachmentLinks(node);
+                    const content = contentText(node);
+                    if (content.length > 12000) continue;
+                    if (attachments.length || content.length >= 80) {
+                        return {
+                            locator: path(node),
+                            contentTextLength: content.length,
+                            attachmentExists: attachments.length > 0,
+                        };
+                    }
+                }
+                return {};
+            }""",
+            {
+                "titleLocator": matched.get("locator", ""),
+                "titleText": matched.get("text", ""),
+            },
+        )
+        container_locator = container.get("locator", "")
+        return NonNewsDetailEvidence(
+            title_match=True,
+            content_rendered=bool(container_locator),
+            matched_title=matched.get("text", ""),
+            content_container_locator=container_locator,
+            content_text_length=int(container.get("contentTextLength", 0)),
+            attachment_exists=bool(container.get("attachmentExists", False)),
+        )
+
+    @staticmethod
     async def _locate_marker(page: Page, marker: str) -> dict[str, str]:
         if not marker:
             return {}
         return await page.evaluate(
-            """marker => {
+            r"""marker => {
                 const needle = String(marker || '').toLowerCase();
                 const visible = element => {
                     const style = getComputedStyle(element);
@@ -298,34 +580,54 @@ class BrowserLinkChecker:
                     if (!text.includes(needle)) return false;
                     return ![...element.children].some(child => (child.innerText || '').toLowerCase().includes(needle));
                 });
-                candidates.sort((left, right) => Number(visible(right)) - Number(visible(left)));
-                let element = candidates[0];
-                let isVisible = element ? visible(element) : false;
-                if (!element) {
+                const context = element => {
+                    const ancestors = [];
+                    for (let node = element; node && node.nodeType === 1; node = node.parentElement) ancestors.push(node);
+                    const auxiliary = ancestors.find(node => {
+                        if (['HEADER', 'NAV', 'FOOTER', 'ASIDE'].includes(node.tagName)) return true;
+                        const label = `${node.id || ''} ${typeof node.className === 'string' ? node.className : ''} ${node.getAttribute('role') || ''} ${node.getAttribute('aria-label') || ''}`;
+                        const id = (node.id || '').toLowerCase();
+                        const pageChrome = ['header', 'gnb', 'global-header', 'site-header'].includes(id) ||
+                            /site-header|global-header|header-wrap|header_wrap|top-nav|top-menu/i.test(label);
+                        const auxiliaryFeature = /comment|reply|subscribe|subscription|share|social|advert|\bad\b|related|prev|next|bookmark|favorite|login[-_ ]?(?:widget|menu|tools)|member[-_ ]?(?:widget|menu|tools)/i.test(label);
+                        return pageChrome || auxiliaryFeature;
+                    });
+                    const semantic = auxiliary || ancestors.find(node =>
+                        ['HEADER', 'NAV', 'FOOTER', 'ASIDE', 'MAIN', 'ARTICLE'].includes(node.tagName) ||
+                        node.getAttribute('role') === 'main'
+                    );
+                    return {auxiliary, semantic};
+                };
+                let inspected = candidates.map(element => ({
+                    element,
+                    visible: visible(element),
+                    ...context(element),
+                }));
+                inspected.sort((left, right) =>
+                    Number(right.visible) - Number(left.visible) ||
+                    Number(Boolean(left.auxiliary)) - Number(Boolean(right.auxiliary))
+                );
+                let selected = inspected[0];
+                if (!selected) {
                     candidates = elements.filter(element => {
                         const text = (element.textContent || '').trim().toLowerCase();
                         if (!text.includes(needle)) return false;
                         return ![...element.children].some(child => (child.textContent || '').toLowerCase().includes(needle));
                     });
-                    element = candidates[0];
-                    isVisible = false;
+                    const element = candidates[0];
+                    if (element) selected = {element, visible: false, ...context(element)};
                 }
-                if (!element) return {};
-                const ancestors = [];
-                for (let node = element; node && node.nodeType === 1; node = node.parentElement) ancestors.push(node);
-                const auxiliary = ancestors.find(node => {
-                    const label = `${node.id || ''} ${node.className || ''} ${node.getAttribute('role') || ''} ${node.getAttribute('aria-label') || ''}`;
-                    return /comment|reply|login|member|account|subscribe|subscription|share|social|advert|\bad\b/i.test(label);
-                });
-                const semantic = auxiliary || ancestors.find(node =>
-                    ['HEADER', 'NAV', 'FOOTER', 'ASIDE', 'MAIN', 'ARTICLE'].includes(node.tagName) ||
-                    node.getAttribute('role') === 'main'
-                );
+                if (!selected) return {};
+                const visibleMatches = inspected.filter(item => item.visible);
+                const auxiliaryOnly = visibleMatches.length > 0 &&
+                    visibleMatches.every(item => Boolean(item.auxiliary));
+                const {element, semantic} = selected;
                 return {
                     text: ((element.innerText || element.textContent || '').trim()).slice(0, 1000),
                     locator: path(element),
                     area: semantic ? path(semantic) : 'body',
-                    visible_yn: isVisible ? 'Y' : 'N',
+                    visible_yn: selected.visible ? 'Y' : 'N',
+                    auxiliary_yn: auxiliaryOnly ? 'Y' : 'N',
                 };
             }""",
             marker,
