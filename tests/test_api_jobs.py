@@ -99,7 +99,7 @@ def test_duplicate_active_job_is_rejected(api):
     assert second.json()["detail"]["active_job_id"] == first.json()["job_id"]
 
 
-def test_cancel_request_and_terminal_conflict(api):
+def test_cancel_request_is_idempotent_through_cancelled(api):
     client, repository, _ = api
     job = client.post("/api/jobs", json=payload()).json()
     cancelled = client.post(f"/api/jobs/{job['job_id']}/cancel")
@@ -107,9 +107,15 @@ def test_cancel_request_and_terminal_conflict(api):
     assert cancelled.json()["status"] == "cancel_requested"
     assert cancelled.json()["cancel_requested_at"]
     assert cancelled.json()["cancel_requested_by"] == "user"
+    for status in ("cancel_requested", "cancelling", "force_terminating"):
+        repository.update_job(job["job_id"], status=status)
+        repeated = client.post(f"/api/jobs/{job['job_id']}/cancel")
+        assert repeated.status_code == 200
+        assert repeated.json()["status"] == status
     repository.update_job(job["job_id"], status="cancelled")
     repeated = client.post(f"/api/jobs/{job['job_id']}/cancel")
-    assert repeated.status_code == 409
+    assert repeated.status_code == 200
+    assert repeated.json()["status"] == "cancelled"
 
 
 def test_resume_uses_previous_checkpoint_with_same_scope(api):

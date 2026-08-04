@@ -14,6 +14,7 @@ from src.regions import resume_checkpoint_path
 from .audit_service import AuditRequest, AuditRunResult, AuditService
 from .job_repository import (
     ACTIVE_STATUSES,
+    CANCELLATION_STATUSES,
     TERMINAL_STATUSES,
     ActiveJobExistsError,
     JobRepository,
@@ -35,6 +36,8 @@ class SqliteProgressReporter(ProgressReporter):
         self.job_id = job_id
 
     def emit(self, event: str, message: str = "", **data: Any) -> None:
+        if event == "cancel_acknowledged":
+            self.repository.acknowledge_cancel(self.job_id)
         fields = {key: value for key, value in data.items() if key in self.PROGRESS_FIELDS}
         stamp = now_iso()
         if event in {"link_completed", "issue_completed", "region_completed"}:
@@ -80,9 +83,12 @@ def _finish_worker_job(repository: JobRepository, job_id: str, result: AuditRunR
         checkpoint_path=str(result.checkpoint_path),
         log_path=str(result.log_path),
         error_message=result.error_message,
-        current_operation="",
-        operation_started_at="",
         termination_reason=result.status,
+        **(
+            {"current_operation": "", "operation_started_at": ""}
+            if result.status == "completed"
+            else {}
+        ),
     )
 
 
@@ -137,8 +143,6 @@ def run_audit_job_worker(db_path: str, job_id: str) -> None:
             status="failed",
             ended_at=now_iso(),
             error_message=message,
-            current_operation="",
-            operation_started_at="",
             termination_reason="worker_exception",
         )
         repository.append_log(job_id, f"작업을 완료하지 못했습니다: {message}", "error")
@@ -154,10 +158,16 @@ class JobManager:
         *,
         worker_launcher: Callable[[str], None] | None = None,
         recover_on_start: bool = True,
+        cancel_grace_seconds: float = 10.0,
+        terminate_grace_seconds: float = 5.0,
     ):
         self.repository = repository
         self._processes: dict[str, multiprocessing.Process] = {}
         self._worker_launcher = worker_launcher
+        self.cancel_grace_seconds = cancel_grace_seconds
+        self.terminate_grace_seconds = terminate_grace_seconds
+        self._cancel_watchdogs: set[str] = set()
+        self._cancel_watchdogs_lock = threading.Lock()
         if recover_on_start:
             self.repository.recover_interrupted_jobs()
 
@@ -229,7 +239,8 @@ class JobManager:
 
     def _watch_process(self, job_id: str, process: multiprocessing.Process) -> None:
         process.join()
-        self._processes.pop(job_id, None)
+        if self._processes.get(job_id) is process:
+            self._processes.pop(job_id, None)
         exit_code = process.exitcode
         job = self.repository.get_job(job_id)
         if not job:
@@ -242,10 +253,14 @@ class JobManager:
         )
         if job["status"] not in ACTIVE_STATUSES:
             return
-        if job["status"] == "cancel_requested":
+        if job["status"] in CANCELLATION_STATUSES:
             status = "cancelled"
             message = "작업 프로세스가 중단되었습니다."
-            termination_reason = "cancel_requested"
+            termination_reason = (
+                "force_terminated"
+                if job["status"] == "force_terminating"
+                else "cancel_requested"
+            )
         elif job["processed_links"]:
             status = "partial_failed"
             message = "작업 프로세스가 예기치 않게 종료되었습니다. 체크포인트에서 재개할 수 있습니다."
@@ -256,25 +271,90 @@ class JobManager:
             termination_reason = "worker_exited_unexpectedly"
         self.repository.update_job(
             job_id, status=status, ended_at=now_iso(), error_message=message,
-            current_operation="", operation_started_at="",
             termination_reason=termination_reason,
         )
         self.repository.append_log(job_id, message, "error")
+
+    def _start_cancel_watchdog(
+        self, job_id: str, process: multiprocessing.Process
+    ) -> None:
+        with self._cancel_watchdogs_lock:
+            if job_id in self._cancel_watchdogs:
+                return
+            self._cancel_watchdogs.add(job_id)
+
+        def enforce() -> None:
+            try:
+                self._enforce_cancel_deadline(job_id, process)
+            finally:
+                with self._cancel_watchdogs_lock:
+                    self._cancel_watchdogs.discard(job_id)
+
+        threading.Thread(
+            target=enforce,
+            name=f"bigkinds-cancel-{job_id[:8]}",
+            daemon=True,
+        ).start()
+
+    def _is_recorded_worker(
+        self, job_id: str, process: multiprocessing.Process, *, require_tracked: bool = True
+    ) -> bool:
+        if require_tracked and self._processes.get(job_id) is not process:
+            return False
+        job = self.repository.get_job(job_id)
+        return bool(
+            job
+            and process.pid is not None
+            and job["worker_pid"] == process.pid
+            and job["status"] in CANCELLATION_STATUSES
+        )
+
+    def _enforce_cancel_deadline(
+        self, job_id: str, process: multiprocessing.Process
+    ) -> None:
+        process.join(timeout=self.cancel_grace_seconds)
+        if not process.is_alive() or not self._is_recorded_worker(job_id, process):
+            return
+        if not self.repository.acknowledge_cancel(job_id):
+            return
+        if not self.repository.mark_force_terminating(job_id, process.pid):
+            return
+        self.repository.append_log(
+            job_id,
+            f"중단 제한시간을 초과하여 작업 프로세스를 종료합니다. pid={process.pid}",
+            "warning",
+        )
+        process.terminate()
+        process.join(timeout=self.terminate_grace_seconds)
+        if not process.is_alive() or not self._is_recorded_worker(job_id, process):
+            return
+        self.repository.append_log(
+            job_id,
+            f"작업 프로세스가 종료되지 않아 최종 종료합니다. pid={process.pid}",
+            "error",
+        )
+        process.kill()
 
     def cancel_job(self, job_id: str) -> dict[str, Any]:
         job = self.repository.get_job(job_id)
         if not job:
             raise KeyError(job_id)
+        if job["status"] == "cancelled":
+            return job
         if job["status"] in TERMINAL_STATUSES:
             raise RuntimeError("이미 종료된 작업입니다.")
         if not self.repository.request_cancel(job_id, requested_by="user"):
             raise RuntimeError("중단 요청을 적용할 수 없습니다.")
         self.repository.append_log(job_id, "중단 요청을 보냈습니다. 현재 링크를 정리한 뒤 종료합니다.", "warning")
+        process = self._processes.get(job_id)
+        if process is not None and process.is_alive():
+            self._start_cancel_watchdog(job_id, process)
         return self.repository.get_job(job_id)  # type: ignore[return-value]
 
     def shutdown(self) -> None:
         for job_id, process in list(self._processes.items()):
             if process.is_alive():
                 self.repository.request_cancel(job_id, requested_by="server_shutdown")
-            process.join(timeout=1)
-        self._processes.clear()
+                self._enforce_cancel_deadline(job_id, process)
+            if not process.is_alive() and self._processes.get(job_id) is process:
+                self._processes.pop(job_id, None)

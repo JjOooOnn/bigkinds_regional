@@ -12,12 +12,15 @@ from src.logging_utils import sanitize
 from src.models import AuditRow
 
 
-ACTIVE_STATUSES = ("queued", "running", "cancel_requested")
+CANCELLATION_STATUSES = ("cancel_requested", "cancelling", "force_terminating")
+ACTIVE_STATUSES = ("queued", "running", *CANCELLATION_STATUSES)
 TERMINAL_STATUSES = ("cancelled", "completed", "partial_failed", "failed")
 STATUS_LABELS = {
     "queued": "대기",
     "running": "실행 중",
     "cancel_requested": "중단 요청",
+    "cancelling": "중단 처리 중",
+    "force_terminating": "강제 종료 중",
     "cancelled": "중단됨",
     "completed": "완료",
     "partial_failed": "일부 실패",
@@ -327,8 +330,11 @@ class JobRepository:
     def touch_heartbeat(self, job_id: str) -> bool:
         with self._connect() as connection:
             cursor = connection.execute(
-                "UPDATE jobs SET heartbeat_at = ? WHERE job_id = ? AND status IN ('running', 'cancel_requested')",
-                (now_iso(), job_id),
+                f"""
+                UPDATE jobs SET heartbeat_at = ?
+                WHERE job_id = ? AND status IN ({','.join('?' for _ in ('running', *CANCELLATION_STATUSES))})
+                """,
+                (now_iso(), job_id, "running", *CANCELLATION_STATUSES),
             )
         return cursor.rowcount == 1
 
@@ -343,12 +349,42 @@ class JobRepository:
                 """,
                 (stamp, sanitize(requested_by), job_id),
             )
+            if cursor.rowcount == 1:
+                return True
+            row = connection.execute(
+                "SELECT status FROM jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+        return bool(row and row["status"] in CANCELLATION_STATUSES)
+
+    def acknowledge_cancel(self, job_id: str) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE jobs SET status = 'cancelling' WHERE job_id = ? AND status = 'cancel_requested'",
+                (job_id,),
+            )
+            if cursor.rowcount == 1:
+                return True
+            row = connection.execute(
+                "SELECT status FROM jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+        return bool(row and row["status"] in {"cancelling", "force_terminating"})
+
+    def mark_force_terminating(self, job_id: str, worker_pid: int) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE jobs SET status = 'force_terminating'
+                WHERE job_id = ? AND worker_pid = ?
+                  AND status IN ('cancel_requested', 'cancelling')
+                """,
+                (job_id, worker_pid),
+            )
         return cursor.rowcount == 1
 
     def is_cancel_requested(self, job_id: str) -> bool:
         with self._connect() as connection:
             row = connection.execute("SELECT status FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
-        return bool(row and row["status"] == "cancel_requested")
+        return bool(row and row["status"] in CANCELLATION_STATUSES)
 
     def append_log(self, job_id: str, message: str, level: str = "info") -> None:
         clean_message = sanitize(message)
@@ -471,10 +507,14 @@ class JobRepository:
         stamp = now_iso()
         with self._connect() as connection:
             rows = connection.execute(
-                "SELECT job_id, status, processed_links FROM jobs WHERE status IN ('queued', 'running', 'cancel_requested')"
+                f"""
+                SELECT job_id, status, processed_links FROM jobs
+                WHERE status IN ({','.join('?' for _ in ACTIVE_STATUSES)})
+                """,
+                ACTIVE_STATUSES,
             ).fetchall()
             for row in rows:
-                if row["status"] == "cancel_requested":
+                if row["status"] in CANCELLATION_STATUSES:
                     status = "cancelled"
                     message = "서버 재시작 후 이전 중단 요청을 반영했습니다."
                 elif row["processed_links"]:

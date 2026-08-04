@@ -5,7 +5,7 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException, Query, Request, status
 from fastapi.responses import FileResponse
 
-from src.application.job_repository import ActiveJobExistsError
+from src.application.job_repository import ACTIVE_STATUSES, ActiveJobExistsError
 from src.config import VERDICTS
 from src.regions import REGION_DISPLAY_ORDER
 
@@ -32,7 +32,7 @@ def _job_or_404(request: Request, job_id: str):
 @router.get("/health")
 def health(request: Request):
     active = next(
-        (job for job in _repository(request).list_jobs(20) if job["status"] in {"queued", "running", "cancel_requested"}),
+        (job for job in _repository(request).list_jobs(20) if job["status"] in ACTIVE_STATUSES),
         None,
     )
     return {"status": "ok", "local_only": True, "active_job_id": active["job_id"] if active else None}
@@ -122,4 +122,3 @@ def download(job_id: str, request: Request):
 def logs(job_id: str, request: Request, limit: int = Query(default=100, ge=1, le=200)):
     _job_or_404(request, job_id)
     return {"logs": _repository(request).get_logs(job_id, limit)}
-

@@ -2,6 +2,8 @@ export type JobStatus =
   | 'queued'
   | 'running'
   | 'cancel_requested'
+  | 'cancelling'
+  | 'force_terminating'
   | 'cancelled'
   | 'completed'
   | 'partial_failed'
@@ -78,4 +80,3 @@ export interface ResultResponse {
   total_errors: number
   errors: ErrorResult[]
 }
-

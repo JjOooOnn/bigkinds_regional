@@ -2,7 +2,8 @@ import { FormEvent, useCallback, useEffect, useMemo, useState } from 'react'
 import { api } from './api'
 import type { AuditJob, JobLog, RegionOption, ResultResponse } from './types'
 
-const ACTIVE = new Set(['queued', 'running', 'cancel_requested'])
+const CANCELLING = new Set(['cancel_requested', 'cancelling', 'force_terminating'])
+const ACTIVE = new Set(['queued', 'running', ...CANCELLING])
 const RESUMABLE = new Set(['cancelled', 'partial_failed', 'failed'])
 const VERDICTS = ['링크오류', '접근제한', '서버오류', '타임아웃', '클릭오류', '빈화면', '확인필요']
 const STORAGE_KEY = 'bigkinds-current-job'
@@ -269,7 +270,7 @@ function ProgressScreen({
       <section className="status-hero" aria-live="polite">
         <div className="pulse-mark" aria-hidden="true"><span /></div>
         <p className="eyebrow">{job.status_label}</p>
-        <h1>{job.status === 'cancel_requested' ? '안전하게 중단하고 있어요' : '링크를 확인하고 있어요'}</h1>
+        <h1>{CANCELLING.has(job.status) ? '안전하게 중단하고 있어요' : '링크를 확인하고 있어요'}</h1>
         <p>{detail}</p>
         {job.current_issue && <p className="current-issue-title">{job.current_issue}</p>}
       </section>
@@ -308,8 +309,8 @@ function ProgressScreen({
       </details>
 
       <div className="bottom-actions">
-        <button className="danger-button" type="button" disabled={cancelling || job.status === 'cancel_requested'} onClick={onCancel}>
-          {job.status === 'cancel_requested' || cancelling ? '중단 요청됨' : '점검 중단'}
+        <button className="danger-button" type="button" disabled={cancelling || CANCELLING.has(job.status)} onClick={onCancel}>
+          {CANCELLING.has(job.status) || cancelling ? '중단 요청됨' : '점검 중단'}
         </button>
         <p>이 페이지를 닫아도 로컬 서버가 실행 중이면 작업은 계속됩니다.</p>
       </div>

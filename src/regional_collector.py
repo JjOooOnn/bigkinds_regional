@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import re
 import time
 from datetime import date, datetime
@@ -28,6 +29,7 @@ from .url_utils import (
     normalize_url,
     resolve_url_reference,
 )
+from .verdict import classify_verdict_detailed, working_yn
 from .regions import REGION_DISPLAY_ORDER, validate_site_regions
 from .application.progress import (
     AuditCancelled,
@@ -42,6 +44,9 @@ AUTOMATION_VERIFICATION_ENVIRONMENTS = (
     ("번들 Chromium headed", {"headless": False}),
     ("Microsoft Edge headed", {"headless": False, "channel": "msedge"}),
 )
+CANCEL_POLL_SECONDS = 0.5
+CLEANUP_TIMEOUT_SECONDS = 5.0
+CLEANUP_TOTAL_SECONDS = 10.0
 
 
 class RegionalCollector:
@@ -59,6 +64,14 @@ class RegionalCollector:
         self.max_issues = max_issues
         self.timeout_ms = timeout_ms
         self.retries = retries
+        timeout_seconds = max(1.0, timeout_ms / 1000)
+        self.article_deadline_seconds = min(
+            180.0,
+            max(45.0, timeout_seconds * (retries + 1) + 15.0),
+        )
+        self.cancel_poll_seconds = CANCEL_POLL_SECONDS
+        self.cleanup_timeout_seconds = CLEANUP_TIMEOUT_SECONDS
+        self.cleanup_total_seconds = CLEANUP_TOTAL_SECONDS
         self.link_delay_ms = link_delay_ms
         self.checkpoint = checkpoint
         self.logger = logger
@@ -186,18 +199,17 @@ class RegionalCollector:
                     "browser_stopping", "Chromium 브라우저를 종료합니다.",
                     browser_state="stopping", current_operation="browser_cleanup",
                 )
-                await self._close_verification_sessions()
                 self._playwright = None
-                # Chromium이 비정상 종료되었거나 사용자가 중단한 경우에도
-                # 이미 닫힌 객체를 다시 닫다가 원래 결과 저장을 방해하지 않는다.
                 try:
-                    await context.close()
-                except Exception:
-                    pass
-                try:
-                    await browser.close()
-                except Exception:
-                    pass
+                    await asyncio.wait_for(
+                        self._cleanup_browser_resources(context, browser),
+                        timeout=self.cleanup_total_seconds,
+                    )
+                except TimeoutError:
+                    self.logger.warning(
+                        "브라우저 전체 정리가 %.1f초 안에 끝나지 않았습니다.",
+                        self.cleanup_total_seconds,
+                    )
                 self.progress_reporter.emit(
                     "browser_stopped", "Chromium 브라우저가 종료되었습니다.",
                     browser_state="stopped", current_operation="playwright_stop",
@@ -208,6 +220,27 @@ class RegionalCollector:
             operation_started_at="",
         )
         return self.checkpoint.rows, self.checkpoint.debug_entries
+
+    async def _cleanup_browser_resources(
+        self, context: BrowserContext, browser: Browser,
+    ) -> None:
+        await self._close_verification_sessions()
+        await self._bounded_cleanup(context.close(), "브라우저 컨텍스트")
+        await self._bounded_cleanup(browser.close(), "Chromium 브라우저")
+
+    async def _bounded_cleanup(self, awaitable, label: str) -> bool:
+        try:
+            await asyncio.wait_for(awaitable, timeout=self.cleanup_timeout_seconds)
+            return True
+        except TimeoutError:
+            self.logger.warning(
+                "%s 정리가 %.1f초 안에 끝나지 않았습니다.",
+                label,
+                self.cleanup_timeout_seconds,
+            )
+        except Exception as exc:
+            self.logger.warning("%s 정리 중 오류: %s", label, sanitize(exc))
+        return False
 
     async def _verification_context(
         self, environment: str, launch_options: dict[str, object],
@@ -224,13 +257,10 @@ class RegionalCollector:
         return context
 
     async def _close_verification_sessions(self) -> None:
-        sessions = list(self._verification_sessions.values())
+        sessions = list(self._verification_sessions.items())
         self._verification_sessions.clear()
-        for browser, _ in reversed(sessions):
-            try:
-                await browser.close()
-            except Exception:
-                pass
+        for environment, (browser, _) in reversed(sessions):
+            await self._bounded_cleanup(browser.close(), f"{environment} 검증 브라우저")
 
     async def _verify_automation_environment_block(
         self, primary: LinkCheckResult, url: str, expected_title: str,
@@ -299,11 +329,8 @@ class RegionalCollector:
             except Exception as exc:
                 attempts.append(f"{environment}: {type(exc).__name__} {sanitize(exc)}")
             finally:
-                try:
-                    if page is not None and not page.is_closed():
-                        await page.close()
-                except Exception:
-                    pass
+                if page is not None and not page.is_closed():
+                    await self._bounded_cleanup(page.close(), f"{environment} 검증 page")
 
         self.checkpoint.add_debug(debug_entry(
             "브라우저환경비교", **debug_context,
@@ -631,10 +658,12 @@ class RegionalCollector:
                     "issue_order": issue_index + 1,
                     "issue_title": issue["title"],
                 }
-                result = await self._click_and_check(
-                    context, page, source_card, checker,
-                    expected_title=source_info.title, debug_context=link_context,
-                    source_type=source_info.source_type,
+                result = await self._run_article_with_controls(
+                    self._click_and_check(
+                        context, page, source_card, checker,
+                        expected_title=source_info.title, debug_context=link_context,
+                        source_type=source_info.source_type,
+                    )
                 )
                 row = AuditRow(
                     requested_date=requested.isoformat(), displayed_date=displayed.isoformat() if displayed else "",
@@ -713,7 +742,7 @@ class RegionalCollector:
                     current_issue_total=issue_total, known_links=self.known_links,
                     processed_links=self.processed_links,
                     normal_count=self.normal_count, error_count=self.error_count,
-                    verdict=result.verdict,
+                    verdict=result.verdict, current_operation="",
                 )
                 if result.verdict != "정상":
                     self._debug(
@@ -751,18 +780,100 @@ class RegionalCollector:
                     )
                 await page.wait_for_timeout(self.link_delay_ms)
         finally:
-            if await close.count() and await close.is_visible():
-                await close.click()
-                await modal.wait_for(state="hidden", timeout=min(self.timeout_ms, 10_000))
-                try:
-                    await page.wait_for_function(
-                        "() => getComputedStyle(document.body).overflow !== 'hidden'",
-                        timeout=min(self.timeout_ms, 5_000),
-                    )
-                except Exception:
-                    pass
-                await self._dismiss_header_overlay(page)
+            try:
+                await asyncio.wait_for(
+                    self._cleanup_issue_modal(page, modal, close),
+                    timeout=self.cleanup_total_seconds,
+                )
+            except TimeoutError:
+                self.logger.warning(
+                    "이슈 모달 전체 정리가 %.1f초 안에 끝나지 않았습니다.",
+                    self.cleanup_total_seconds,
+                )
         return True
+
+    async def _cleanup_issue_modal(self, page: Page, modal: Locator, close: Locator) -> None:
+        if not await close.count() or not await close.is_visible():
+            return
+        await close.click(timeout=min(self.timeout_ms, 5_000))
+        await modal.wait_for(state="hidden", timeout=min(self.timeout_ms, 5_000))
+        try:
+            await page.wait_for_function(
+                "() => getComputedStyle(document.body).overflow !== 'hidden'",
+                timeout=min(self.timeout_ms, 5_000),
+            )
+        except Exception:
+            pass
+        await self._dismiss_header_overlay(page)
+
+    async def _run_article_with_controls(self, article_check) -> LinkCheckResult:
+        article_task = asyncio.create_task(article_check)
+        cancel_task = asyncio.create_task(self._wait_for_cancel_request())
+        try:
+            done, _ = await asyncio.wait(
+                {article_task, cancel_task},
+                timeout=self.article_deadline_seconds,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if cancel_task in done:
+                self._acknowledge_cancellation()
+                await self._cancel_article_task(article_task)
+                raise AuditCancelled("사용자가 점검 중단을 요청했습니다.")
+            if article_task in done:
+                return article_task.result()
+
+            await self._cancel_article_task(article_task)
+            decision = classify_verdict_detailed(
+                http_status=None,
+                final_url="",
+                title="",
+                body_text="",
+                timed_out=True,
+            )
+            message = (
+                f"기사 전체 점검 제한시간 {self.article_deadline_seconds:.1f}초를 초과했습니다."
+            )
+            self.logger.warning(message)
+            return LinkCheckResult(
+                browser_result=decision.display,
+                link_working_yn=working_yn(decision.verdict),
+                verdict=decision.verdict,
+                response_seconds=round(self.article_deadline_seconds, 3),
+                error_message=message,
+                access_reason_code="ARTICLE_DEADLINE_EXCEEDED",
+            )
+        finally:
+            cancel_task.cancel()
+            await asyncio.gather(cancel_task, return_exceptions=True)
+
+    async def _wait_for_cancel_request(self) -> None:
+        while not self.cancellation_token.is_cancel_requested():
+            await asyncio.sleep(self.cancel_poll_seconds)
+
+    async def _cancel_article_task(self, article_task: asyncio.Task) -> bool:
+        article_task.cancel()
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(article_task),
+                timeout=self.cleanup_timeout_seconds,
+            )
+        except asyncio.CancelledError:
+            return True
+        except TimeoutError:
+            self.logger.warning(
+                "기사 task 정리가 %.1f초 안에 끝나지 않았습니다.",
+                self.cleanup_timeout_seconds,
+            )
+            return False
+        except Exception:
+            return True
+        return True
+
+    def _acknowledge_cancellation(self) -> None:
+        self.progress_reporter.emit(
+            "cancel_acknowledged",
+            "중단 요청을 확인했습니다. 현재 결과를 정리합니다.",
+        )
 
     async def _modal_from_close(self, close: Locator) -> Locator:
         # 진단 HTML에는 role=dialog/aria-modal/id가 없다. 닫기 버튼에서 시작해
@@ -1029,9 +1140,15 @@ class RegionalCollector:
                     continue
                 break
             finally:
-                await self._take_window_open_capture(source_page, capture_key)
+                try:
+                    await asyncio.wait_for(
+                        self._take_window_open_capture(source_page, capture_key),
+                        timeout=self.cleanup_timeout_seconds,
+                    )
+                except Exception:
+                    pass
                 if target and not target.is_closed():
-                    await target.close()
+                    await self._bounded_cleanup(target.close(), "검사 page")
 
         result = checker.click_error((self.retries + 1) * popup_timeout / 1000)
         self._attach_url_diagnostics(
@@ -1086,7 +1203,7 @@ class RegionalCollector:
             return result
         finally:
             if not target.is_closed():
-                await target.close()
+                await self._bounded_cleanup(target.close(), "URL 검사 page")
 
     @staticmethod
     def _attach_url_diagnostics(
@@ -1230,5 +1347,5 @@ class RegionalCollector:
 
     def _raise_if_cancelled(self) -> None:
         if self.cancellation_token.is_cancel_requested():
-            self.progress_reporter.emit("cancel_acknowledged", "중단 요청을 확인했습니다. 현재 결과를 정리합니다.")
+            self._acknowledge_cancellation()
             raise AuditCancelled("사용자가 점검 중단을 요청했습니다.")

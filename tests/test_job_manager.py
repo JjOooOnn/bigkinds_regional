@@ -6,7 +6,11 @@ import sqlite3
 import pytest
 
 from src.application.job_manager import JobManager, SqliteProgressReporter, _heartbeat_loop
-from src.application.job_repository import JobRepository, OBSERVABILITY_COLUMNS
+from src.application.job_repository import (
+    CANCELLATION_STATUSES,
+    JobRepository,
+    OBSERVABILITY_COLUMNS,
+)
 
 
 def _config():
@@ -56,13 +60,15 @@ def test_records_are_restored_after_server_restart(tmp_path):
     assert restored["termination_reason"] == "server_restart"
 
 
-def test_cancel_requested_state_is_restored_as_cancelled(tmp_path):
+@pytest.mark.parametrize("cancel_status", CANCELLATION_STATUSES)
+def test_cancel_requested_state_is_restored_as_cancelled(tmp_path, cancel_status):
     repository = JobRepository(tmp_path / "jobs.sqlite3")
     manager = JobManager(
         repository, worker_launcher=lambda _job_id: None, recover_on_start=False
     )
     job = manager.create_job(_config())
     manager.cancel_job(job["job_id"])
+    repository.update_job(job["job_id"], status=cancel_status)
     JobManager(repository, worker_launcher=lambda _job_id: None, recover_on_start=True)
     assert repository.get_job(job["job_id"])["status"] == "cancelled"
 
@@ -97,6 +103,34 @@ def test_observability_fields_distinguish_heartbeat_progress_and_cancel_source(t
     cancelled = repository.get_job(job_id)
     assert cancelled["cancel_requested_at"]
     assert cancelled["cancel_requested_by"] == "test_user"
+    reporter.emit("cancel_acknowledged", "cancel acknowledged")
+    assert repository.get_job(job_id)["status"] == "cancelling"
+
+
+def test_cancel_state_transitions_are_monotonic_idempotent_and_pid_scoped(tmp_path):
+    repository = JobRepository(tmp_path / "jobs.sqlite3")
+    manager = JobManager(repository, worker_launcher=lambda _job_id: None, recover_on_start=False)
+    job = manager.create_job(_config())
+    job_id = job["job_id"]
+    assert repository.mark_started(job_id, 9876)
+
+    assert repository.request_cancel(job_id, requested_by="first_user")
+    requested = repository.get_job(job_id)
+    assert repository.request_cancel(job_id, requested_by="second_user")
+    repeated = repository.get_job(job_id)
+    assert repeated["cancel_requested_at"] == requested["cancel_requested_at"]
+    assert repeated["cancel_requested_by"] == "first_user"
+
+    assert repository.acknowledge_cancel(job_id)
+    assert repository.acknowledge_cancel(job_id)
+    assert repository.get_job(job_id)["status"] == "cancelling"
+    assert not repository.mark_force_terminating(job_id, 1111)
+    assert repository.mark_force_terminating(job_id, 9876)
+    assert repository.request_cancel(job_id, requested_by="late_user")
+    forced = repository.get_job(job_id)
+    assert forced["status"] == "force_terminating"
+    assert forced["cancel_requested_by"] == "first_user"
+    assert repository.is_cancel_requested(job_id)
 
 
 def test_heartbeat_loop_updates_until_stopped():
