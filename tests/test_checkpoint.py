@@ -4,11 +4,12 @@ import asyncio
 import json
 import logging
 from datetime import date
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 from src.checkpoint import CheckpointStore
 from src.models import AuditRow
-from src.regional_collector import RegionalCollector
+from src.regional_collector import BrowserSessionFailure, RegionalCollector
 
 
 def _row(original_url: str = "https://example.com/article") -> AuditRow:
@@ -120,5 +121,52 @@ def test_only_started_issues_are_retried_and_failed_issue_blocks_region_completi
             date(2026, 8, 4), "test-region", 0,
         )
         collector._audit_issue.assert_not_awaited()
+
+    asyncio.run(scenario())
+
+
+def test_browser_recovery_retries_the_same_started_issue(tmp_path):
+    async def scenario() -> None:
+        checkpoint = CheckpointStore(tmp_path / "checkpoint.jsonl")
+        checkpoint.mark_issue_started("2026-08-04", "test-region", 1)
+        collector = RegionalCollector(
+            start_date=date(2026, 8, 4),
+            end_date=date(2026, 8, 4),
+            regions=["test-region"],
+            headed=False,
+            max_issues=None,
+            timeout_ms=1_000,
+            retries=0,
+            link_delay_ms=0,
+            checkpoint=checkpoint,
+            logger=logging.getLogger("test_checkpoint_recovery"),
+        )
+        page, context = AsyncMock(), AsyncMock()
+        collector._session = SimpleNamespace(
+            browser=AsyncMock(), context=context, page=page,
+        )
+        collector._select_region = AsyncMock(return_value=True)
+        collector._issue_cards = AsyncMock(return_value=[object()])
+        failure = BrowserSessionFailure(
+            "page_closed", "inspection page closed",
+            inspection_page_only=True,
+            article_key=("2026-08-04", "test-region", 1, 1),
+        )
+
+        async def audit_issue(*_args):
+            if collector._audit_issue.await_count == 1:
+                raise failure
+            checkpoint.mark_issue_completed("2026-08-04", "test-region", 1)
+            return True
+
+        collector._audit_issue = AsyncMock(side_effect=audit_issue)
+
+        assert await collector._audit_region(
+            page, context, AsyncMock(), date(2026, 8, 4),
+            date(2026, 8, 4), "test-region", 0,
+        )
+        assert collector._audit_issue.await_count == 2
+        assert checkpoint.issue_status("2026-08-04", "test-region", 1) == "completed"
+        assert collector.browser_restart_count == 1
 
     asyncio.run(scenario())

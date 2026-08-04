@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import re
 import time
+from dataclasses import dataclass
 from datetime import date, datetime
 
 from playwright.async_api import (
@@ -47,6 +48,28 @@ AUTOMATION_VERIFICATION_ENVIRONMENTS = (
 CANCEL_POLL_SECONDS = 0.5
 CLEANUP_TIMEOUT_SECONDS = 5.0
 CLEANUP_TOTAL_SECONDS = 10.0
+MAX_ARTICLE_RECOVERIES = 1
+MAX_JOB_RECOVERIES = 2
+
+
+@dataclass
+class _BrowserSession:
+    browser: Browser
+    context: BrowserContext
+    page: Page
+
+
+class BrowserSessionFailure(RuntimeError):
+    """Playwright 호출 오류를 실제 브라우저 계층 상태와 함께 전달한다."""
+
+    def __init__(
+        self, state: str, message: str, *, inspection_page_only: bool = False,
+        article_key: tuple[str, str, int, int] | None = None,
+    ):
+        super().__init__(message)
+        self.state = state
+        self.inspection_page_only = inspection_page_only
+        self.article_key = article_key
 
 
 class RegionalCollector:
@@ -92,6 +115,14 @@ class RegionalCollector:
         self.first_url_by_page: dict[Page, str] = {}
         self._playwright: Playwright | None = None
         self._verification_sessions: dict[str, tuple[Browser, BrowserContext]] = {}
+        self._session: _BrowserSession | None = None
+        self._disconnected_browsers: set[Browser] = set()
+        self._unexpected_closed_pages: set[Page] = set()
+        self._intentional_page_closes: set[Page] = set()
+        self._intentional_browser_closes: set[Browser] = set()
+        self._current_article_key: tuple[str, str, int, int] | None = None
+        self._article_recovery_counts: dict[tuple[str, str, int, int], int] = {}
+        self.browser_restart_count = 0
 
     @staticmethod
     def _desktop_chromium_user_agent(browser_version: str) -> str:
@@ -109,30 +140,17 @@ class RegionalCollector:
             "playwright_starting", "Playwright를 시작합니다.",
             browser_state="playwright_starting", current_operation="playwright_start",
         )
-        async with async_playwright() as playwright:
+        try:
+            playwright = await async_playwright().start()
             self._playwright = playwright
             self.progress_reporter.emit(
                 "playwright_started", "Playwright가 시작되었습니다.",
                 browser_state="playwright_started", current_operation="browser_launch",
             )
-            browser = await playwright.chromium.launch(headless=not self.headed)
-            self.progress_reporter.emit(
-                "browser_started", "Chromium 브라우저가 시작되었습니다.",
-                browser_state="running", current_operation="browser_context_create",
-            )
-            context_options: dict[str, object] = {"locale": "ko-KR"}
-            if not self.headed:
-                context_options["user_agent"] = self._desktop_chromium_user_agent(browser.version)
-            context = await browser.new_context(**context_options)
-            context.set_default_timeout(self.timeout_ms)
-            self._track_navigation(context)
-            page = await context.new_page()
+            self._session = await self._create_browser_session()
             try:
-                await page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=60_000)
-                await page.wait_for_timeout(4_000)
-                region_names = await self._read_regions(page)
+                region_names = await self._read_regions(self._session.page)
                 selected_regions = self._select_requested_regions(region_names)
-                navigator = DateNavigator(page, self.timeout_ms)
                 checker = BrowserLinkChecker(self.timeout_ms, self.retries)
                 requested_dates = list(inclusive_dates(self.start_date, self.end_date))
                 total_region_units = len(requested_dates) * len(selected_regions)
@@ -150,7 +168,23 @@ class RegionalCollector:
                         "date_started", f"{requested.isoformat()} 점검을 시작합니다.",
                         current_date=requested.isoformat(),
                     )
-                    ok, displayed = await navigator.move_to(requested, retries=1)
+                    session = self._session
+                    try:
+                        ok, displayed = await DateNavigator(
+                            session.page, self.timeout_ms,
+                        ).move_to(requested, retries=1)
+                    except Exception as exc:
+                        failure = self._browser_session_failure(
+                            session.page, session.context, exc,
+                        )
+                        if failure is None or not await self._recover_browser_session(
+                            failure, requested, None,
+                        ):
+                            raise
+                        session = self._session
+                        ok, displayed = await DateNavigator(
+                            session.page, self.timeout_ms,
+                        ).move_to(requested, retries=1)
                     if not ok:
                         self.had_partial_failures = True
                         self._debug("날짜이동", requested, displayed, event="화면표시일 불일치", details=f"요청 {requested}, 화면 {displayed}")
@@ -176,8 +210,10 @@ class RegionalCollector:
                             completed_regions=self.completed_region_units,
                             total_region_units=total_region_units,
                         )
+                        session = self._session
                         completed = await self._audit_region(
-                            page, context, checker, requested, displayed, region, region_order
+                            session.page, session.context, checker,
+                            requested, displayed, region, region_order,
                         )
                         if completed:
                             self.checkpoint.mark_completed(*key)
@@ -199,33 +235,237 @@ class RegionalCollector:
                     "browser_stopping", "Chromium 브라우저를 종료합니다.",
                     browser_state="stopping", current_operation="browser_cleanup",
                 )
-                self._playwright = None
-                try:
-                    await asyncio.wait_for(
-                        self._cleanup_browser_resources(context, browser),
-                        timeout=self.cleanup_total_seconds,
-                    )
-                except TimeoutError:
-                    self.logger.warning(
-                        "브라우저 전체 정리가 %.1f초 안에 끝나지 않았습니다.",
-                        self.cleanup_total_seconds,
-                    )
+                session = self._session
+                self._session = None
+                if session is not None:
+                    try:
+                        await asyncio.wait_for(
+                            self._cleanup_browser_resources(session.context, session.browser),
+                            timeout=self.cleanup_total_seconds,
+                        )
+                    except TimeoutError:
+                        self.logger.warning(
+                            "브라우저 전체 정리가 %.1f초 안에 끝나지 않았습니다.",
+                            self.cleanup_total_seconds,
+                        )
                 self.progress_reporter.emit(
                     "browser_stopped", "Chromium 브라우저가 종료되었습니다.",
                     browser_state="stopped", current_operation="playwright_stop",
                 )
-        self.progress_reporter.emit(
-            "playwright_stopped", "Playwright가 종료되었습니다.",
-            browser_state="stopped", current_operation="",
-            operation_started_at="",
-        )
+        finally:
+            playwright = self._playwright
+            self._playwright = None
+            if playwright is not None:
+                await self._bounded_cleanup(playwright.stop(), "Playwright")
+            self.progress_reporter.emit(
+                "playwright_stopped", "Playwright가 종료되었습니다.",
+                browser_state="stopped", current_operation="",
+                operation_started_at="",
+            )
         return self.checkpoint.rows, self.checkpoint.debug_entries
+
+    async def _create_browser_session(self) -> _BrowserSession:
+        if self._playwright is None:
+            raise RuntimeError("브라우저 세션에 사용할 Playwright 실행기가 없습니다.")
+        browser = await self._playwright.chromium.launch(headless=not self.headed)
+        self._track_browser_lifecycle(browser)
+        self.progress_reporter.emit(
+            "browser_started", "Chromium 브라우저가 시작되었습니다.",
+            browser_state="running", current_operation="browser_context_create",
+            browser_restart_count=self.browser_restart_count,
+        )
+        context_options: dict[str, object] = {"locale": "ko-KR"}
+        if not self.headed:
+            context_options["user_agent"] = self._desktop_chromium_user_agent(browser.version)
+        context = await browser.new_context(**context_options)
+        context.set_default_timeout(self.timeout_ms)
+        self._track_navigation(context)
+        page = await context.new_page()
+        self._track_page_lifecycle(page, "BigKinds page")
+        await page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=60_000)
+        await page.wait_for_timeout(4_000)
+        return _BrowserSession(browser=browser, context=context, page=page)
+
+    def _track_browser_lifecycle(self, browser: Browser) -> None:
+        def on_disconnected(*_args) -> None:
+            self._disconnected_browsers.add(browser)
+            if browser in self._intentional_browser_closes:
+                return
+            self.logger.error("Chromium 브라우저 연결이 예기치 않게 종료되었습니다.")
+            self.progress_reporter.emit(
+                "browser_disconnected", "Chromium 브라우저 연결이 종료되었습니다.",
+                browser_state="disconnected",
+                browser_restart_count=self.browser_restart_count,
+            )
+
+        browser.on("disconnected", on_disconnected)
+
+    def _track_page_lifecycle(self, page: Page, label: str) -> None:
+        def on_close(*_args) -> None:
+            if page in self._intentional_page_closes:
+                return
+            self._unexpected_closed_pages.add(page)
+            self.logger.error("%s가 예기치 않게 종료되었습니다.", label)
+            self.progress_reporter.emit(
+                "inspection_page_closed", f"{label}가 예기치 않게 종료되었습니다.",
+                browser_state="page_closed",
+                browser_restart_count=self.browser_restart_count,
+            )
+
+        page.on("close", on_close)
+
+    def _browser_session_failure(
+        self, source_page: Page, context: BrowserContext, exc: Exception,
+        *, target: Page | None = None,
+    ) -> BrowserSessionFailure | None:
+        browser = context.browser
+        try:
+            connected = browser.is_connected()
+        except Exception:
+            connected = False
+        if browser in self._disconnected_browsers or not connected:
+            return BrowserSessionFailure(
+                "disconnected", sanitize(exc), article_key=self._current_article_key,
+            )
+
+        if target is not None:
+            try:
+                target_closed = target.is_closed()
+            except Exception:
+                target_closed = False
+            if target_closed or target in self._unexpected_closed_pages:
+                return BrowserSessionFailure(
+                    "page_closed", sanitize(exc), inspection_page_only=True,
+                    article_key=self._current_article_key,
+                )
+
+        try:
+            source_closed = source_page.is_closed()
+        except Exception:
+            source_closed = False
+        if source_closed or source_page in self._unexpected_closed_pages:
+            return BrowserSessionFailure(
+                "page_closed", sanitize(exc), article_key=self._current_article_key,
+            )
+
+        # 수명주기 이벤트와 연결 상태 확인이 먼저다. 드라이버가 호출 직전에
+        # 끊어진 경우에만 Playwright의 연결 종료 문구를 보조 증거로 사용한다.
+        message = sanitize(exc).lower()
+        if "connection closed" in message or "playwright" in message and "closed" in message:
+            return BrowserSessionFailure(
+                "disconnected", sanitize(exc), article_key=self._current_article_key,
+            )
+        if "target page, context or browser has been closed" in message:
+            return BrowserSessionFailure(
+                "page_closed", sanitize(exc), inspection_page_only=target is not None,
+                article_key=self._current_article_key,
+            )
+        return None
+
+    async def _recover_browser_session(
+        self, failure: BrowserSessionFailure, requested: date, region: str | None,
+    ) -> bool:
+        self._raise_if_cancelled()
+        article_key = failure.article_key
+        article_recoveries = self._article_recovery_counts.get(article_key, 0) if article_key else 0
+        if (
+            self.browser_restart_count >= MAX_JOB_RECOVERIES
+            or article_key is not None and article_recoveries >= MAX_ARTICLE_RECOVERIES
+        ):
+            self.logger.error(
+                "브라우저 복구 상한 초과: 상태=%s, 기사복구=%d/%d, 작업복구=%d/%d",
+                failure.state, article_recoveries, MAX_ARTICLE_RECOVERIES,
+                self.browser_restart_count, MAX_JOB_RECOVERIES,
+            )
+            self.progress_reporter.emit(
+                "browser_recovery_exhausted", "브라우저 복구 상한을 초과했습니다.",
+                browser_state=failure.state,
+                browser_restart_count=self.browser_restart_count,
+            )
+            return False
+
+        self.browser_restart_count += 1
+        if article_key is not None:
+            self._article_recovery_counts[article_key] = article_recoveries + 1
+        self.progress_reporter.emit(
+            "browser_restarting", "브라우저 세션을 복구합니다.",
+            browser_state="restarting",
+            browser_restart_count=self.browser_restart_count,
+        )
+        self.logger.warning(
+            "브라우저 세션 복구 %d/%d: 상태=%s, 기사=%s",
+            self.browser_restart_count, MAX_JOB_RECOVERIES, failure.state,
+            article_key or "진행 단계",
+        )
+
+        try:
+            if failure.inspection_page_only:
+                # 기사 재시도 시 _click_and_check가 새 검사 page를 만든다.
+                pass
+            elif failure.state == "page_closed" and self._session is not None:
+                page = await self._session.context.new_page()
+                self._track_page_lifecycle(page, "BigKinds page")
+                await page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=60_000)
+                await page.wait_for_timeout(4_000)
+                self._session.page = page
+            else:
+                old_session = self._session
+                self._session = None
+                if old_session is not None:
+                    try:
+                        await asyncio.wait_for(
+                            self._cleanup_browser_resources(
+                                old_session.context, old_session.browser,
+                            ),
+                            timeout=self.cleanup_total_seconds,
+                        )
+                    except Exception as cleanup_exc:
+                        self.logger.warning(
+                            "종료된 브라우저 세션 정리 실패: %s", sanitize(cleanup_exc),
+                        )
+                old_playwright = self._playwright
+                self._playwright = None
+                if old_playwright is not None:
+                    await self._bounded_cleanup(old_playwright.stop(), "종료된 Playwright")
+                self._playwright = await async_playwright().start()
+                self._session = await self._create_browser_session()
+
+            if not failure.inspection_page_only:
+                session = self._session
+                ok, displayed = await DateNavigator(
+                    session.page, self.timeout_ms,
+                ).move_to(requested, retries=1)
+                if not ok:
+                    raise RuntimeError(
+                        f"복구 후 날짜 복귀 실패: 요청 {requested}, 화면 {displayed}"
+                    )
+                if region and not await self._select_region(session.page, region):
+                    raise RuntimeError(f"복구 후 지역 복귀 실패: {region}")
+            self.progress_reporter.emit(
+                "browser_recovered", "브라우저 세션 복구가 완료되었습니다.",
+                browser_state="running",
+                browser_restart_count=self.browser_restart_count,
+                current_date=requested.isoformat(), current_region=region or "",
+            )
+            return True
+        except AuditCancelled:
+            raise
+        except Exception as exc:
+            self.logger.error("브라우저 세션 복구 실패: %s", sanitize(exc))
+            self.progress_reporter.emit(
+                "browser_recovery_failed", "브라우저 세션 복구에 실패했습니다.",
+                browser_state=failure.state,
+                browser_restart_count=self.browser_restart_count,
+            )
+            return False
 
     async def _cleanup_browser_resources(
         self, context: BrowserContext, browser: Browser,
     ) -> None:
         await self._close_verification_sessions()
+        self._intentional_page_closes.update(context.pages)
         await self._bounded_cleanup(context.close(), "브라우저 컨텍스트")
+        self._intentional_browser_closes.add(browser)
         await self._bounded_cleanup(browser.close(), "Chromium 브라우저")
 
     async def _bounded_cleanup(self, awaitable, label: str) -> bool:
@@ -241,6 +481,10 @@ class RegionalCollector:
         except Exception as exc:
             self.logger.warning("%s 정리 중 오류: %s", label, sanitize(exc))
         return False
+
+    async def _close_page(self, page: Page, label: str) -> bool:
+        self._intentional_page_closes.add(page)
+        return await self._bounded_cleanup(page.close(), label)
 
     async def _verification_context(
         self, environment: str, launch_options: dict[str, object],
@@ -283,6 +527,7 @@ class RegionalCollector:
             try:
                 context = await self._verification_context(environment, launch_options)
                 page = await context.new_page()
+                self._track_page_lifecycle(page, f"{environment} 검증 page")
                 verifier = BrowserLinkChecker(self.timeout_ms, retries=0)
                 verified = await verifier.open_url(
                     page, url, started_at, {}, expected_title=expected_title,
@@ -330,7 +575,7 @@ class RegionalCollector:
                 attempts.append(f"{environment}: {type(exc).__name__} {sanitize(exc)}")
             finally:
                 if page is not None and not page.is_closed():
-                    await self._bounded_cleanup(page.close(), f"{environment} 검증 page")
+                    await self._close_page(page, f"{environment} 검증 page")
 
         self.checkpoint.add_debug(debug_entry(
             "브라우저환경비교", **debug_context,
@@ -545,15 +790,18 @@ class RegionalCollector:
             if not cards:
                 self.logger.info("[%s][%s] 데이터 없음", req, region)
                 return True
-            for issue_index in range(len(cards)):
+            issue_index = 0
+            while issue_index < len(cards):
                 self._raise_if_cancelled()
                 issue_status = getattr(self.checkpoint, "issue_status", lambda *_args: "")(
                     req, region, issue_index + 1
                 )
                 if issue_status == "completed":
+                    issue_index += 1
                     continue
                 if issue_status == "failed":
                     region_complete = False
+                    issue_index += 1
                     continue
                 self.logger.info("[%s][%s] 이슈 %d/%d 점검", req, region, issue_index + 1, len(cards))
                 try:
@@ -564,6 +812,7 @@ class RegionalCollector:
                     if not issue_completed:
                         self.had_partial_failures = True
                         region_complete = False
+                        issue_index += 1
                         continue
                     self.progress_reporter.emit(
                         "issue_completed", f"이슈 {issue_index + 1}/{len(cards)} 확인 완료",
@@ -571,13 +820,32 @@ class RegionalCollector:
                         current_issue_order=issue_index + 1, current_issue_total=len(cards),
                         current_operation="",
                     )
+                    issue_index += 1
                 except AuditCancelled:
                     raise
                 except Exception as exc:
+                    failure = exc if isinstance(exc, BrowserSessionFailure) else (
+                        self._browser_session_failure(page, context, exc)
+                    )
+                    if failure is not None:
+                        if await self._recover_browser_session(failure, requested, region):
+                            session = self._session
+                            page, context = session.page, session.context
+                            checker = BrowserLinkChecker(self.timeout_ms, self.retries)
+                            displayed = requested
+                            continue
+                        mark_failed = getattr(self.checkpoint, "mark_issue_failed", None)
+                        if mark_failed is not None:
+                            mark_failed(req, region, issue_index + 1)
+                        self.had_partial_failures = True
+                        region_complete = False
+                        break
+                    self._current_article_key = None
                     self.had_partial_failures = True
                     region_complete = False
                     self._debug("이슈순회", requested, displayed, region=region, issue_order=issue_index + 1,
                                 event="이슈 처리 실패", exception_type=type(exc).__name__, details=exc)
+                    issue_index += 1
             return region_complete
         except AuditCancelled:
             raise
@@ -664,6 +932,9 @@ class RegionalCollector:
                 return False
             for source_order, (source_card, source_info) in enumerate(sources, 1):
                 self._raise_if_cancelled()
+                self._current_article_key = (
+                    requested.isoformat(), region, issue_index + 1, source_order,
+                )
                 self.progress_reporter.emit(
                     "link_started",
                     f"출처 링크 {source_order}/{len(sources)} 확인 중",
@@ -686,6 +957,7 @@ class RegionalCollector:
                         source_type=source_info.source_type,
                     )
                 )
+                self._current_article_key = None
                 row = AuditRow(
                     requested_date=requested.isoformat(), displayed_date=displayed.isoformat() if displayed else "",
                     region=region, issue_order=issue_index + 1, issue_title=issue["title"], issue_categories=categories,
@@ -764,6 +1036,8 @@ class RegionalCollector:
                     processed_links=self.processed_links,
                     normal_count=self.normal_count, error_count=self.error_count,
                     verdict=result.verdict, current_operation="",
+                    browser_state="running",
+                    browser_restart_count=self.browser_restart_count,
                 )
                 if result.verdict != "정상":
                     self._debug(
@@ -970,6 +1244,7 @@ class RegionalCollector:
                     async with context.expect_page(timeout=popup_timeout) as page_info:
                         await click_target.click(force=True)
                     target = await page_info.value
+                    self._track_page_lifecycle(target, "검사 page")
                 except PlaywrightTimeoutError:
                     await source_page.wait_for_timeout(500)
                     captured_raw = await self._take_window_open_capture(source_page, capture_key)
@@ -1123,6 +1398,13 @@ class RegionalCollector:
                     )
                 return result
             except Exception as exc:
+                if isinstance(exc, BrowserSessionFailure):
+                    raise
+                failure = self._browser_session_failure(
+                    source_page, context, exc, target=target,
+                )
+                if failure is not None:
+                    raise failure from exc
                 captured_raw = captured_raw or await self._take_window_open_capture(
                     source_page, capture_key,
                 )
@@ -1172,7 +1454,7 @@ class RegionalCollector:
                 except Exception:
                     pass
                 if target and not target.is_closed():
-                    await self._bounded_cleanup(target.close(), "검사 page")
+                    await self._close_page(target, "검사 page")
 
         result = checker.click_error((self.retries + 1) * popup_timeout / 1000)
         self._attach_url_diagnostics(
@@ -1199,6 +1481,7 @@ class RegionalCollector:
         started: float | None = None,
     ) -> LinkCheckResult:
         target = await context.new_page()
+        self._track_page_lifecycle(target, "URL 검사 page")
         started = started if started is not None else time.perf_counter()
         try:
             result = await checker.open_url(
@@ -1225,9 +1508,17 @@ class RegionalCollector:
                     debug_context["region"], int(debug_context["issue_order"]), result.verdict,
                 )
             return result
+        except Exception as exc:
+            failure = self._browser_session_failure(
+                self._session.page if self._session is not None else target,
+                context, exc, target=target,
+            )
+            if failure is not None:
+                raise failure from exc
+            raise
         finally:
             if not target.is_closed():
-                await self._bounded_cleanup(target.close(), "URL 검사 page")
+                await self._close_page(target, "URL 검사 page")
 
     @staticmethod
     def _attach_url_diagnostics(
