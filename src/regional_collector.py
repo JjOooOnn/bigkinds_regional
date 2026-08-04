@@ -534,6 +534,7 @@ class RegionalCollector:
         requested: date, displayed: date | None, region: str, region_order: int,
     ) -> bool:
         req = requested.isoformat()
+        region_complete = True
         self.logger.info("[%s][%s] 지역 점검 시작", req, region)
         try:
             if not await self._select_region(page, region):
@@ -546,6 +547,14 @@ class RegionalCollector:
                 return True
             for issue_index in range(len(cards)):
                 self._raise_if_cancelled()
+                issue_status = getattr(self.checkpoint, "issue_status", lambda *_args: "")(
+                    req, region, issue_index + 1
+                )
+                if issue_status == "completed":
+                    continue
+                if issue_status == "failed":
+                    region_complete = False
+                    continue
                 self.logger.info("[%s][%s] 이슈 %d/%d 점검", req, region, issue_index + 1, len(cards))
                 try:
                     issue_completed = await self._audit_issue(
@@ -554,6 +563,7 @@ class RegionalCollector:
                     )
                     if not issue_completed:
                         self.had_partial_failures = True
+                        region_complete = False
                         continue
                     self.progress_reporter.emit(
                         "issue_completed", f"이슈 {issue_index + 1}/{len(cards)} 확인 완료",
@@ -565,9 +575,10 @@ class RegionalCollector:
                     raise
                 except Exception as exc:
                     self.had_partial_failures = True
+                    region_complete = False
                     self._debug("이슈순회", requested, displayed, region=region, issue_order=issue_index + 1,
                                 event="이슈 처리 실패", exception_type=type(exc).__name__, details=exc)
-            return True
+            return region_complete
         except AuditCancelled:
             raise
         except Exception as exc:
@@ -601,7 +612,8 @@ class RegionalCollector:
             current_issue_total=issue_total,
         )
         self.issue_keys.add((requested.isoformat(), region, issue_index + 1))
-        self.checkpoint.mark_issue(requested.isoformat(), region, issue_index + 1)
+        mark_started = getattr(self.checkpoint, "mark_issue_started", self.checkpoint.mark_issue)
+        mark_started(requested.isoformat(), region, issue_index + 1)
         categories = ", ".join(x for x in issue["categories"] if x in ISSUE_CATEGORIES)
         # 고정 헤더의 투명 backdrop이 카드 위 포인터 이벤트를 가로채는 경우가
         # 실제 사이트에서 확인되었다. 카드 자체의 click handler를 직접 실행한다.
@@ -640,7 +652,16 @@ class RegionalCollector:
             self._debug("출처수집", requested, displayed, region=region, issue_order=issue_index + 1,
                         issue_title=issue["title"], event="출처 카드 파싱 불일치",
                         details=f"직접 자식 카드 {actual_card_count}, 파싱 성공 {len(sources)}")
+        source_cards_complete = (
+            source_match is not None
+            and source_count == actual_card_count == len(sources)
+        )
         try:
+            if not source_cards_complete:
+                mark_failed = getattr(self.checkpoint, "mark_issue_failed", None)
+                if mark_failed is not None:
+                    mark_failed(requested.isoformat(), region, issue_index + 1)
+                return False
             for source_order, (source_card, source_info) in enumerate(sources, 1):
                 self._raise_if_cancelled()
                 self.progress_reporter.emit(
@@ -790,6 +811,9 @@ class RegionalCollector:
                     "이슈 모달 전체 정리가 %.1f초 안에 끝나지 않았습니다.",
                     self.cleanup_total_seconds,
                 )
+        mark_completed = getattr(self.checkpoint, "mark_issue_completed", None)
+        if mark_completed is not None:
+            mark_completed(requested.isoformat(), region, issue_index + 1)
         return True
 
     async def _cleanup_issue_modal(self, page: Page, modal: Locator, close: Locator) -> None:

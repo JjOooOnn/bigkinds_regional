@@ -20,6 +20,7 @@ class CheckpointStore:
         self.debug_entries: list[DebugEntry] = []
         self.completed: set[tuple[str, str]] = set()
         self.issue_keys: set[tuple[str, str, int]] = set()
+        self.issue_statuses: dict[tuple[str, str, int], str] = {}
         self.stored_run_config: dict | None = None
         if resume:
             self._load()
@@ -40,12 +41,24 @@ class CheckpointStore:
                     self.debug_entries.append(DebugEntry(**item["data"]))
                 elif item_type == "completed":
                     self.completed.add((item["requested_date"], item["region"]))
-                elif item_type == "issue":
-                    self.issue_keys.add((item["requested_date"], item["region"], int(item["issue_order"])))
+                elif item_type in {"issue", "issue_started", "issue_completed", "issue_failed"}:
+                    key = (item["requested_date"], item["region"], int(item["issue_order"]))
+                    status = "started" if item_type in {"issue", "issue_started"} else item_type.removeprefix("issue_")
+                    self._load_issue_status(key, status)
             except (ValueError, TypeError, KeyError):
                 continue
         self.rows = deduplicate_rows(self.rows)
-        self.issue_keys.update((row.requested_date, row.region, row.issue_order) for row in self.rows)
+        for row in self.rows:
+            self._load_issue_status(
+                (row.requested_date, row.region, row.issue_order), "started"
+            )
+
+    def _load_issue_status(self, key: tuple[str, str, int], status: str) -> None:
+        previous = self.issue_statuses.get(key)
+        if previous in {"completed", "failed"}:
+            return
+        self.issue_statuses[key] = status
+        self.issue_keys.add(key)
 
     def _validate_run_config(self) -> None:
         if self.run_config is None:
@@ -90,14 +103,39 @@ class CheckpointStore:
         self.debug_entries.append(entry)
         self._append({"type": "debug", "data": entry.to_dict()})
 
-    def mark_issue(self, requested_date: str, region: str, issue_order: int) -> None:
+    def issue_status(self, requested_date: str, region: str, issue_order: int) -> str:
+        return self.issue_statuses.get((requested_date, region, issue_order), "")
+
+    def mark_issue_started(self, requested_date: str, region: str, issue_order: int) -> None:
         key = (requested_date, region, issue_order)
-        if key not in self.issue_keys:
-            self.issue_keys.add(key)
+        if key not in self.issue_statuses:
+            self._load_issue_status(key, "started")
             self._append({
-                "type": "issue", "requested_date": requested_date,
+                "type": "issue_started", "requested_date": requested_date,
                 "region": region, "issue_order": issue_order,
             })
+
+    def mark_issue_completed(self, requested_date: str, region: str, issue_order: int) -> None:
+        self._mark_issue_terminal(requested_date, region, issue_order, "completed")
+
+    def mark_issue_failed(self, requested_date: str, region: str, issue_order: int) -> None:
+        self._mark_issue_terminal(requested_date, region, issue_order, "failed")
+
+    def _mark_issue_terminal(
+        self, requested_date: str, region: str, issue_order: int, status: str,
+    ) -> None:
+        key = (requested_date, region, issue_order)
+        if self.issue_statuses.get(key) in {"completed", "failed"}:
+            return
+        self._load_issue_status(key, status)
+        self._append({
+            "type": f"issue_{status}", "requested_date": requested_date,
+            "region": region, "issue_order": issue_order,
+        })
+
+    def mark_issue(self, requested_date: str, region: str, issue_order: int) -> None:
+        """Compatibility wrapper for callers written before explicit issue states."""
+        self.mark_issue_started(requested_date, region, issue_order)
 
     def mark_completed(self, requested_date: str, region: str) -> None:
         key = (requested_date, region)
