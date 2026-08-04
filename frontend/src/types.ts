@@ -25,6 +25,9 @@ export interface AuditJob {
   headed: boolean
   resume: boolean
   resume_from_job_id: string
+  manual_resume_available: boolean
+  manual_resume_reason: string
+  checkpoint_state: string
   max_issues: number | null
   timeout_seconds: number
   retries: number

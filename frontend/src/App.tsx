@@ -4,7 +4,7 @@ import type { AuditJob, JobLog, JobStatus, RegionOption, ResultResponse } from '
 
 const CANCELLING = new Set(['cancel_requested', 'cancelling', 'force_terminating'])
 const ACTIVE = new Set(['queued', 'running', ...CANCELLING])
-const RESUMABLE = new Set(['cancelled', 'partial_failed', 'failed'])
+const RESUMABLE = new Set(['partial_failed', 'failed'])
 const VERDICTS = ['링크오류', '접근제한', '서버오류', '타임아웃', '클릭오류', '빈화면', '확인필요']
 const STORAGE_KEY = 'bigkinds-current-job'
 const EMPTY_FILTERS = { verdict: '', region: '', publisher: '', title: '' }
@@ -120,7 +120,9 @@ function SetupScreen({
   const regionError = !allRegions && selected.length === 0
     ? '점검할 지역을 하나 이상 선택해 주세요.'
     : ''
-  const resumableJobs = jobs.filter((job) => RESUMABLE.has(job.status))
+  const resumableJobs = jobs.filter(
+    (job) => RESUMABLE.has(job.status) && job.manual_resume_available,
+  )
   const canSubmit = Boolean(startDate && endDate && !dateError && !regionError && !submitting)
 
   function toggleRegion(name: string) {
@@ -271,7 +273,7 @@ function SetupScreen({
             <div className="resume-box">
               <label className="check-line">
                 <input type="checkbox" checked={resume} onChange={(event) => setResume(event.target.checked)} />
-                중단되거나 일부 실패한 작업에서 재개
+                일부 실패한 작업에서 재개
               </label>
               {resume && (
                 <label>
@@ -427,6 +429,11 @@ function ResultsScreen({
       </section>
 
       {job.error_message && <div className="notice warning-notice" role="status">{job.error_message}</div>}
+      {job.manual_resume_available && (
+        <div className="notice resume-notice" role="status">
+          {job.manual_resume_reason || '체크포인트에서 수동으로 재개할 수 있습니다.'}
+        </div>
+      )}
 
       <section className="summary-grid" aria-label="점검 결과 요약">
         <div><span>전체 링크</span><strong>{summary.total_links.toLocaleString()}</strong></div>

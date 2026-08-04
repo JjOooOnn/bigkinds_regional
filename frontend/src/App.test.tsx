@@ -19,6 +19,7 @@ function baseJob(overrides = {}) {
     job_id: 'job-1', created_at: '2026-07-20T09:00:00+09:00', started_at: '', ended_at: '',
     start_date: '2026-07-08', end_date: '2026-07-08', regions: ['서울특별시'], headed: false,
     resume: false, resume_from_job_id: '', max_issues: null, timeout_seconds: 30, retries: 2,
+    manual_resume_available: false, manual_resume_reason: '', checkpoint_state: '',
     link_delay_seconds: 0.5, debug: false, status: 'queued', status_label: '대기', current_date: '',
     current_region: '', current_issue: '', current_issue_order: 0, current_issue_total: 0,
     current_region_completed_issues: 0, current_region_total_issues: null,
@@ -36,6 +37,30 @@ beforeEach(() => {
 })
 
 describe('점검 설정 화면', () => {
+  it('수동 재개가 가능한 실패 작업만 재개 대상으로 표시한다', async () => {
+    const cancelled = baseJob({
+      job_id: 'cancelled-job', status: 'cancelled', status_label: '중단됨',
+      manual_resume_available: false,
+    })
+    const resumable = baseJob({
+      job_id: 'partial-job', status: 'partial_failed', status_label: '일부 실패',
+      manual_resume_available: true,
+      manual_resume_reason: '체크포인트에서 수동으로 재개할 수 있습니다.',
+      checkpoint_state: 'incomplete',
+    })
+    vi.spyOn(globalThis, 'fetch').mockImplementation((input) => {
+      if (String(input) === '/api/config/regions') return json({ regions })
+      if (String(input) === '/api/jobs') return json({ jobs: [cancelled, resumable] })
+      return json({})
+    })
+
+    render(<App />)
+    const resumeToggle = await screen.findByLabelText('일부 실패한 작업에서 재개')
+    fireEvent.click(resumeToggle)
+    expect(screen.getByRole('option', { name: /일부 실패/ })).toBeInTheDocument()
+    expect(screen.queryByRole('option', { name: /중단됨/ })).not.toBeInTheDocument()
+  })
+
   it('날짜 오류와 지역 복수 선택을 표시하고 유효할 때 실행한다', async () => {
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation((input, init) => {
       const url = String(input)

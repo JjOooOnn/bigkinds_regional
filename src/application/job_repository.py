@@ -8,6 +8,7 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Iterable
 
+from src.checkpoint import CheckpointStore
 from src.logging_utils import sanitize
 from src.models import AuditRow
 
@@ -39,6 +40,7 @@ JOB_FIELDS = {
     "heartbeat_at", "last_progress_at", "current_operation",
     "operation_started_at", "browser_state", "browser_restart_count",
     "cancel_requested_at", "cancel_requested_by", "termination_reason",
+    "manual_resume_available", "manual_resume_reason", "checkpoint_state",
 }
 
 OBSERVABILITY_COLUMNS = {
@@ -60,6 +62,9 @@ OBSERVABILITY_COLUMNS = {
     "cancel_requested_at": "TEXT NOT NULL DEFAULT ''",
     "cancel_requested_by": "TEXT NOT NULL DEFAULT ''",
     "termination_reason": "TEXT NOT NULL DEFAULT ''",
+    "manual_resume_available": "INTEGER NOT NULL DEFAULT 0",
+    "manual_resume_reason": "TEXT NOT NULL DEFAULT ''",
+    "checkpoint_state": "TEXT NOT NULL DEFAULT ''",
 }
 
 
@@ -168,7 +173,10 @@ class JobRepository:
                     browser_restart_count INTEGER NOT NULL DEFAULT 0,
                     cancel_requested_at TEXT NOT NULL DEFAULT '',
                     cancel_requested_by TEXT NOT NULL DEFAULT '',
-                    termination_reason TEXT NOT NULL DEFAULT ''
+                    termination_reason TEXT NOT NULL DEFAULT '',
+                    manual_resume_available INTEGER NOT NULL DEFAULT 0,
+                    manual_resume_reason TEXT NOT NULL DEFAULT '',
+                    checkpoint_state TEXT NOT NULL DEFAULT ''
                 );
                 CREATE INDEX IF NOT EXISTS idx_jobs_created_at ON jobs(created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
@@ -297,7 +305,7 @@ class JobRepository:
     def _decode_job(row: sqlite3.Row) -> dict[str, Any]:
         item = dict(row)
         item["regions"] = json.loads(item.pop("regions_json"))
-        for name in ("headed", "resume", "debug"):
+        for name in ("headed", "resume", "debug", "manual_resume_available"):
             item[name] = bool(item[name])
         item["status_label"] = STATUS_LABELS.get(item["status"], item["status"])
         excel = Path(item["excel_path"]) if item["excel_path"] else None
@@ -317,7 +325,7 @@ class JobRepository:
             "error_message", "current_issue", "current_region", "current_date",
             "current_publisher", "current_article_title", "current_operation",
             "browser_state", "cancel_requested_by",
-            "termination_reason",
+            "termination_reason", "manual_resume_reason", "checkpoint_state",
         ):
             if key in values:
                 values[key] = sanitize(values[key])
@@ -523,34 +531,136 @@ class JobRepository:
             ).fetchall()
         return int(count), [dict(row) for row in rows]
 
+    @staticmethod
+    def _checkpoint_resume_details(
+        job: dict[str, Any], status: str,
+    ) -> tuple[dict[str, Any], list[AuditRow], bool]:
+        checkpoint_path = Path(job.get("checkpoint_path") or "")
+        if not checkpoint_path.is_file():
+            return {
+                "manual_resume_available": False,
+                "manual_resume_reason": (
+                    "취소된 작업은 재개할 수 없습니다."
+                    if status == "cancelled" else "재개할 체크포인트 파일이 없습니다."
+                ),
+                "checkpoint_state": "missing",
+            }, [], False
+        try:
+            checkpoint = CheckpointStore(checkpoint_path, resume=True)
+            config = checkpoint.stored_run_config
+            if not config:
+                raise ValueError("실행 조건이 없습니다.")
+            start = date.fromisoformat(str(config["start_date"]))
+            end = date.fromisoformat(str(config["end_date"]))
+            regions = list(config.get("regions") or [])
+            total_units = ((end - start).days + 1) * len(regions)
+            checkpoint_state = (
+                "complete" if total_units and len(checkpoint.completed) >= total_units
+                else "incomplete"
+            )
+        except Exception as exc:
+            return {
+                "manual_resume_available": False,
+                "manual_resume_reason": (
+                    "취소된 작업은 재개할 수 없습니다."
+                    if status == "cancelled"
+                    else f"체크포인트를 읽을 수 없습니다: {sanitize(exc)}"
+                ),
+                "checkpoint_state": "invalid",
+            }, [], False
+
+        if status == "cancelled":
+            available = False
+            reason = "취소된 작업은 재개할 수 없습니다."
+        elif status not in {"partial_failed", "failed"}:
+            available = False
+            reason = "종료 상태가 수동 재개 대상이 아닙니다."
+        elif checkpoint_state == "complete":
+            available = False
+            reason = "체크포인트에 완료된 작업으로 기록되어 있습니다."
+        else:
+            available = True
+            reason = "체크포인트에서 수동으로 재개할 수 있습니다."
+        return {
+            "manual_resume_available": available,
+            "manual_resume_reason": reason,
+            "checkpoint_state": checkpoint_state,
+        }, list(checkpoint.rows), True
+
+    def refresh_resume_metadata(self, job_id: str) -> dict[str, Any]:
+        job = self.get_job(job_id)
+        if not job:
+            raise KeyError(job_id)
+        metadata, _, _ = self._checkpoint_resume_details(job, job["status"])
+        self.update_job(job_id, **metadata)
+        return self.get_job(job_id)  # type: ignore[return-value]
+
+    def finalize_interrupted_job(
+        self,
+        job_id: str,
+        *,
+        status: str,
+        error_message: str,
+        termination_reason: str,
+        worker_exit_code: int | None = None,
+    ) -> dict[str, Any]:
+        job = self.get_job(job_id)
+        if not job:
+            raise KeyError(job_id)
+        metadata, rows, checkpoint_loaded = self._checkpoint_resume_details(job, status)
+        if status == "failed" and rows:
+            status = "partial_failed"
+            metadata, rows, checkpoint_loaded = self._checkpoint_resume_details(job, status)
+        fields: dict[str, Any] = {
+            "status": status,
+            "ended_at": now_iso(),
+            "error_message": error_message,
+            "termination_reason": termination_reason,
+            **metadata,
+        }
+        if worker_exit_code is not None:
+            fields["worker_exit_code"] = worker_exit_code
+        if checkpoint_loaded:
+            self.replace_results(job_id, rows)
+            normal_count = sum(row.verdict == "정상" for row in rows)
+            fields.update(
+                processed_links=len(rows),
+                normal_count=normal_count,
+                error_count=len(rows) - normal_count,
+            )
+        self.update_job(job_id, **fields)
+        return self.get_job(job_id)  # type: ignore[return-value]
+
     def recover_interrupted_jobs(self) -> int:
-        stamp = now_iso()
         with self._connect() as connection:
             rows = connection.execute(
                 f"""
-                SELECT job_id, status, processed_links FROM jobs
+                SELECT job_id FROM jobs
                 WHERE status IN ({','.join('?' for _ in ACTIVE_STATUSES)})
                 """,
                 ACTIVE_STATUSES,
             ).fetchall()
-            for row in rows:
-                if row["status"] in CANCELLATION_STATUSES:
-                    status = "cancelled"
-                    message = "서버 재시작 후 이전 중단 요청을 반영했습니다."
-                elif row["processed_links"]:
-                    status = "partial_failed"
-                    message = "서버가 재시작되어 실행을 계속할 수 없습니다. 체크포인트에서 다시 시작할 수 있습니다."
-                else:
-                    status = "failed"
-                    message = "서버가 재시작되어 대기 또는 실행 중이던 작업이 종료되었습니다."
-                connection.execute(
-                    """
-                    UPDATE jobs
-                    SET status = ?, ended_at = ?, error_message = ?,
-                        current_operation = '', operation_started_at = '',
-                        termination_reason = 'server_restart'
-                    WHERE job_id = ?
-                    """,
-                    (status, stamp, message, row["job_id"]),
+        for row in rows:
+            job = self.get_job(row["job_id"])
+            if not job:
+                continue
+            if job["status"] in CANCELLATION_STATUSES:
+                status = "cancelled"
+                message = "서버 재시작 후 이전 중단 요청을 반영했습니다."
+                reason = "server_restart_after_cancel"
+            elif job["processed_links"]:
+                status = "partial_failed"
+                message = "서버가 재시작되어 실행을 계속할 수 없습니다."
+                reason = "server_restart"
+            else:
+                _, checkpoint_rows, _ = self._checkpoint_resume_details(
+                    job, "partial_failed",
                 )
+                status = "partial_failed" if checkpoint_rows else "failed"
+                message = "서버가 재시작되어 대기 또는 실행 중이던 작업이 종료되었습니다."
+                reason = "server_restart"
+            self.finalize_interrupted_job(
+                job["job_id"], status=status, error_message=message,
+                termination_reason=reason,
+            )
         return len(rows)

@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from pathlib import Path
 
 import pytest
 
+from conftest import make_row
+from src.checkpoint import CheckpointStore
 from src.application.job_manager import JobManager, SqliteProgressReporter, _heartbeat_loop
 from src.application.job_repository import (
     CANCELLATION_STATUSES,
@@ -43,7 +46,18 @@ def test_records_are_restored_after_server_restart(tmp_path):
     )
     job = first_manager.create_job(_config())
     repository.mark_started(job["job_id"], 4321)
-    repository.update_job(job["job_id"], processed_links=3, normal_count=2, error_count=1)
+    checkpoint = CheckpointStore(
+        Path(job["checkpoint_path"]),
+        run_config={
+            "start_date": "2026-07-08", "end_date": "2026-07-08",
+            "regions": ["충청북도"], "selection_mode": "선택",
+        },
+    )
+    checkpoint.add_row(make_row(requested_date="2026-07-08", region="충청북도"))
+    repository.update_job(
+        job["job_id"], processed_links=1, normal_count=1,
+        current_operation="link_check:interrupted", browser_state="running",
+    )
 
     restored_repository = JobRepository(db_path)
     JobManager(
@@ -52,12 +66,17 @@ def test_records_are_restored_after_server_restart(tmp_path):
     restored = restored_repository.get_job(job["job_id"])
     assert restored is not None
     assert restored["status"] == "partial_failed"
-    assert restored["processed_links"] == 3
-    assert "다시 시작" in restored["error_message"]
+    assert restored["processed_links"] == 1
+    assert "서버가 재시작" in restored["error_message"]
     assert restored["worker_pid"] == 4321
     assert restored["attempt_number"] == 1
     assert restored["heartbeat_at"]
     assert restored["termination_reason"] == "server_restart"
+    assert restored["current_operation"] == "link_check:interrupted"
+    assert restored["browser_state"] == "running"
+    assert restored["manual_resume_available"] is True
+    assert restored["checkpoint_state"] == "incomplete"
+    assert restored_repository.get_result_summary(job["job_id"])["total_links"] == 1
 
 
 @pytest.mark.parametrize("cancel_status", CANCELLATION_STATUSES)
@@ -70,7 +89,10 @@ def test_cancel_requested_state_is_restored_as_cancelled(tmp_path, cancel_status
     manager.cancel_job(job["job_id"])
     repository.update_job(job["job_id"], status=cancel_status)
     JobManager(repository, worker_launcher=lambda _job_id: None, recover_on_start=True)
-    assert repository.get_job(job["job_id"])["status"] == "cancelled"
+    restored = repository.get_job(job["job_id"])
+    assert restored["status"] == "cancelled"
+    assert restored["manual_resume_available"] is False
+    assert "취소된 작업" in restored["manual_resume_reason"]
 
 
 def test_observability_fields_distinguish_heartbeat_progress_and_cancel_source(tmp_path):

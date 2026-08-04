@@ -107,6 +107,7 @@ input:focus, select:focus { border-color: var(--blue); background: #fff; }
 .notice, .global-error { border-radius: 14px; padding: 15px 18px; }
 .error-notice, .global-error { color: #8f3535; background: #fff0f0; }
 .warning-notice { color: #795b19; background: #fff8df; margin: 18px 0; }
+.resume-notice { color: #285e46; background: #eaf8f2; margin: 18px 0; }
 .global-error { width: min(1060px, calc(100% - 40px)); margin: 18px auto 0; display: flex; justify-content: space-between; }
 .global-error button { border: 0; background: none; cursor: pointer; font-size: 20px; }
 

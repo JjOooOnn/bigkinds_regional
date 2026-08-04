@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -59,6 +60,7 @@ def test_create_job_with_all_regions_and_read_status(api):
     assert job["status"] == "queued"
     assert job["attempt_number"] == 0
     assert job["browser_state"] == "not_started"
+    assert job["manual_resume_available"] is False
     assert job["heartbeat_at"] == ""
     assert job["regions"] == list(REGION_DISPLAY_ORDER)
     assert job["total_regions"] == 17
@@ -150,13 +152,12 @@ def test_resume_uses_previous_checkpoint_with_same_scope(api):
     client, repository, launched = api
     previous = client.post("/api/jobs", json=payload()).json()
     checkpoint = repository.get_job(previous["job_id"])["checkpoint_path"]
-    from pathlib import Path
     Path(checkpoint).parent.mkdir(parents=True, exist_ok=True)
     Path(checkpoint).write_text(
         '{"type":"run_config","data":{"start_date":"2026-07-08","end_date":"2026-07-08","regions":["충청북도"],"selection_mode":"선택"}}\n',
         encoding="utf-8",
     )
-    repository.update_job(previous["job_id"], status="cancelled")
+    repository.update_job(previous["job_id"], status="partial_failed")
     resumed = client.post(
         "/api/jobs",
         json=payload(resume=True, resume_from_job_id=previous["job_id"]),
@@ -165,6 +166,25 @@ def test_resume_uses_previous_checkpoint_with_same_scope(api):
     assert resumed.json()["resume"] is True
     assert resumed.json()["checkpoint_path"] == checkpoint
     assert launched[-1] == resumed.json()["job_id"]
+
+
+def test_cancelled_job_cannot_be_resumed_even_with_a_checkpoint(api):
+    client, repository, _ = api
+    previous = client.post("/api/jobs", json=payload()).json()
+    checkpoint = Path(repository.get_job(previous["job_id"])["checkpoint_path"])
+    checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint.write_text(
+        '{"type":"run_config","data":{"start_date":"2026-07-08","end_date":"2026-07-08","regions":["충청북도"],"selection_mode":"선택"}}\n',
+        encoding="utf-8",
+    )
+    repository.update_job(previous["job_id"], status="cancelled")
+
+    response = client.post(
+        "/api/jobs",
+        json=payload(resume=True, resume_from_job_id=previous["job_id"]),
+    )
+    assert response.status_code == 422
+    assert "취소된 작업" in response.json()["detail"]
 
 
 def test_results_filters_and_logs(api):

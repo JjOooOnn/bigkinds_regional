@@ -156,7 +156,7 @@ class AuditService:
         excel_path: Path | None = None
         reporter.emit(
             "postprocessing_started", "결과 Excel을 생성합니다.",
-            current_operation="excel_generation",
+            **({"current_operation": "excel_generation"} if status == "completed" else {}),
         )
         try:
             completed_region_units = len(checkpoint.completed)
@@ -177,17 +177,20 @@ class AuditService:
             error_message = sanitize(exc)
             logger.error("Excel 저장 실패: %s", error_message)
 
+        finished_data = {
+            "status": status,
+            "processed_links": len(checkpoint.rows),
+            "normal_count": sum(row.verdict == "정상" for row in checkpoint.rows),
+            "error_count": sum(row.verdict != "정상" for row in checkpoint.rows),
+            "excel_path": str(excel_path or ""),
+            "error_message": error_message,
+        }
+        if status == "completed":
+            finished_data.update(current_operation="", operation_started_at="")
         reporter.emit(
             "audit_finished",
             "점검이 중단되었습니다." if status == "cancelled" else "점검이 완료되었습니다.",
-            status=status,
-            processed_links=len(checkpoint.rows),
-            normal_count=sum(row.verdict == "정상" for row in checkpoint.rows),
-            error_count=sum(row.verdict != "정상" for row in checkpoint.rows),
-            excel_path=str(excel_path or ""),
-            error_message=error_message,
-            current_operation="",
-            operation_started_at="",
+            **finished_data,
         )
         return AuditRunResult(
             status=status,

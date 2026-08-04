@@ -93,6 +93,7 @@ def _finish_worker_job(repository: JobRepository, job_id: str, result: AuditRunR
             else {}
         ),
     )
+    repository.refresh_resume_metadata(job_id)
 
 
 def _heartbeat_loop(repository: JobRepository, job_id: str, stop: threading.Event) -> None:
@@ -184,6 +185,9 @@ class JobManager:
                 raise ValueError("재개할 이전 작업을 찾을 수 없습니다.")
             if source["status"] not in TERMINAL_STATUSES:
                 raise ValueError("아직 실행 중인 작업에서는 재개할 수 없습니다.")
+            source = self.repository.refresh_resume_metadata(resume_from_job_id)
+            if not source["manual_resume_available"]:
+                raise ValueError(source["manual_resume_reason"] or "이 작업은 재개할 수 없습니다.")
             for key in ("start_date", "end_date", "regions"):
                 if source[key] != config[key]:
                     raise ValueError("재개 작업의 날짜와 지역은 이전 작업과 같아야 합니다.")
@@ -242,41 +246,54 @@ class JobManager:
 
     def _watch_process(self, job_id: str, process: multiprocessing.Process) -> None:
         process.join()
-        if self._processes.get(job_id) is process:
-            self._processes.pop(job_id, None)
-        exit_code = process.exitcode
-        job = self.repository.get_job(job_id)
-        if not job:
-            return
-        self.repository.update_job(job_id, worker_exit_code=exit_code)
-        self.repository.append_log(
-            job_id,
-            f"작업 프로세스가 종료되었습니다. pid={process.pid}, exit_code={exit_code}",
-            "info" if exit_code == 0 else "error",
-        )
-        if job["status"] not in ACTIVE_STATUSES:
-            return
-        if job["status"] in CANCELLATION_STATUSES:
-            status = "cancelled"
-            message = "작업 프로세스가 중단되었습니다."
-            termination_reason = (
-                "force_terminated"
-                if job["status"] == "force_terminating"
-                else "cancel_requested"
+        try:
+            exit_code = process.exitcode
+            job = self.repository.get_job(job_id)
+            if not job:
+                return
+            self.repository.update_job(job_id, worker_exit_code=exit_code)
+            self.repository.append_log(
+                job_id,
+                f"작업 프로세스가 종료되었습니다. pid={process.pid}, exit_code={exit_code}",
+                "info" if exit_code == 0 else "error",
             )
-        elif job["processed_links"]:
-            status = "partial_failed"
-            message = "작업 프로세스가 예기치 않게 종료되었습니다. 체크포인트에서 재개할 수 있습니다."
-            termination_reason = "worker_exited_unexpectedly"
-        else:
-            status = "failed"
-            message = "작업 프로세스가 예기치 않게 종료되었습니다."
-            termination_reason = "worker_exited_unexpectedly"
-        self.repository.update_job(
-            job_id, status=status, ended_at=now_iso(), error_message=message,
-            termination_reason=termination_reason,
-        )
-        self.repository.append_log(job_id, message, "error")
+            job = self.repository.get_job(job_id)
+            if not job or job["status"] not in ACTIVE_STATUSES:
+                return
+            if job["status"] in CANCELLATION_STATUSES:
+                status = "cancelled"
+                message = "작업 프로세스가 중단되었습니다."
+                termination_reason = (
+                    "force_terminated"
+                    if job["status"] == "force_terminating"
+                    else "cancel_requested"
+                )
+            elif job["processed_links"]:
+                status = "partial_failed"
+                message = "작업 프로세스가 예기치 않게 종료되었습니다."
+                termination_reason = "worker_exited_unexpectedly"
+            else:
+                status = "failed"
+                message = "작업 프로세스가 예기치 않게 종료되었습니다."
+                termination_reason = "worker_exited_unexpectedly"
+            finalized = self.repository.finalize_interrupted_job(
+                job_id,
+                status=status,
+                error_message=message,
+                termination_reason=termination_reason,
+                worker_exit_code=exit_code,
+            )
+            self.repository.append_log(
+                job_id,
+                (
+                    f"{message} {finalized['manual_resume_reason']}"
+                    if finalized["manual_resume_reason"] else message
+                ),
+                "error",
+            )
+        finally:
+            if self._processes.get(job_id) is process:
+                self._processes.pop(job_id, None)
 
     def _start_cancel_watchdog(
         self, job_id: str, process: multiprocessing.Process

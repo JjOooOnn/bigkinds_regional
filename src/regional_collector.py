@@ -136,6 +136,7 @@ class RegionalCollector:
         )
 
     async def run(self) -> tuple[list[AuditRow], list]:
+        clear_diagnostics = False
         self.progress_reporter.emit(
             "playwright_starting", "Playwright를 시작합니다.",
             browser_state="playwright_starting", current_operation="playwright_start",
@@ -255,10 +256,10 @@ class RegionalCollector:
                             )
                         else:
                             self.had_partial_failures = True
+                clear_diagnostics = not self.had_partial_failures
             finally:
                 self.progress_reporter.emit(
                     "browser_stopping", "Chromium 브라우저를 종료합니다.",
-                    browser_state="stopping", current_operation="browser_cleanup",
                 )
                 session = self._session
                 self._session = None
@@ -275,8 +276,10 @@ class RegionalCollector:
                         )
                 self.progress_reporter.emit(
                     "browser_stopped", "Chromium 브라우저가 종료되었습니다.",
-                    browser_state="stopped", current_operation="playwright_stop",
                 )
+        except BaseException:
+            clear_diagnostics = False
+            raise
         finally:
             playwright = self._playwright
             self._playwright = None
@@ -284,8 +287,13 @@ class RegionalCollector:
                 await self._bounded_cleanup(playwright.stop(), "Playwright")
             self.progress_reporter.emit(
                 "playwright_stopped", "Playwright가 종료되었습니다.",
-                browser_state="stopped", current_operation="",
-                operation_started_at="",
+                **(
+                    {
+                        "browser_state": "stopped", "current_operation": "",
+                        "operation_started_at": "",
+                    }
+                    if clear_diagnostics else {}
+                ),
             )
         return self.checkpoint.rows, self.checkpoint.debug_entries
 
