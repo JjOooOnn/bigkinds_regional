@@ -57,6 +57,9 @@ def test_create_job_with_all_regions_and_read_status(api):
     assert response.status_code == 201
     job = response.json()
     assert job["status"] == "queued"
+    assert job["attempt_number"] == 0
+    assert job["browser_state"] == "not_started"
+    assert job["heartbeat_at"] == ""
     assert job["regions"] == list(REGION_DISPLAY_ORDER)
     assert job["total_regions"] == 17
     assert launched == [job["job_id"]]
@@ -102,6 +105,8 @@ def test_cancel_request_and_terminal_conflict(api):
     cancelled = client.post(f"/api/jobs/{job['job_id']}/cancel")
     assert cancelled.status_code == 200
     assert cancelled.json()["status"] == "cancel_requested"
+    assert cancelled.json()["cancel_requested_at"]
+    assert cancelled.json()["cancel_requested_by"] == "user"
     repository.update_job(job["job_id"], status="cancelled")
     repeated = client.post(f"/api/jobs/{job['job_id']}/cancel")
     assert repeated.status_code == 409

@@ -92,9 +92,21 @@ class RegionalCollector:
         )
 
     async def run(self) -> tuple[list[AuditRow], list]:
+        self.progress_reporter.emit(
+            "playwright_starting", "Playwright를 시작합니다.",
+            browser_state="playwright_starting", current_operation="playwright_start",
+        )
         async with async_playwright() as playwright:
             self._playwright = playwright
+            self.progress_reporter.emit(
+                "playwright_started", "Playwright가 시작되었습니다.",
+                browser_state="playwright_started", current_operation="browser_launch",
+            )
             browser = await playwright.chromium.launch(headless=not self.headed)
+            self.progress_reporter.emit(
+                "browser_started", "Chromium 브라우저가 시작되었습니다.",
+                browser_state="running", current_operation="browser_context_create",
+            )
             context_options: dict[str, object] = {"locale": "ko-KR"}
             if not self.headed:
                 context_options["user_agent"] = self._desktop_chromium_user_agent(browser.version)
@@ -170,6 +182,10 @@ class RegionalCollector:
                         else:
                             self.had_partial_failures = True
             finally:
+                self.progress_reporter.emit(
+                    "browser_stopping", "Chromium 브라우저를 종료합니다.",
+                    browser_state="stopping", current_operation="browser_cleanup",
+                )
                 await self._close_verification_sessions()
                 self._playwright = None
                 # Chromium이 비정상 종료되었거나 사용자가 중단한 경우에도
@@ -182,6 +198,15 @@ class RegionalCollector:
                     await browser.close()
                 except Exception:
                     pass
+                self.progress_reporter.emit(
+                    "browser_stopped", "Chromium 브라우저가 종료되었습니다.",
+                    browser_state="stopped", current_operation="playwright_stop",
+                )
+        self.progress_reporter.emit(
+            "playwright_stopped", "Playwright가 종료되었습니다.",
+            browser_state="stopped", current_operation="",
+            operation_started_at="",
+        )
         return self.checkpoint.rows, self.checkpoint.debug_entries
 
     async def _verification_context(
@@ -496,7 +521,19 @@ class RegionalCollector:
                 self._raise_if_cancelled()
                 self.logger.info("[%s][%s] 이슈 %d/%d 점검", req, region, issue_index + 1, len(cards))
                 try:
-                    await self._audit_issue(page, context, checker, requested, displayed, region, region_order, issue_index, len(cards))
+                    issue_completed = await self._audit_issue(
+                        page, context, checker, requested, displayed, region,
+                        region_order, issue_index, len(cards),
+                    )
+                    if not issue_completed:
+                        self.had_partial_failures = True
+                        continue
+                    self.progress_reporter.emit(
+                        "issue_completed", f"이슈 {issue_index + 1}/{len(cards)} 확인 완료",
+                        current_date=requested.isoformat(), current_region=region,
+                        current_issue_order=issue_index + 1, current_issue_total=len(cards),
+                        current_operation="",
+                    )
                 except AuditCancelled:
                     raise
                 except Exception as exc:
@@ -520,7 +557,7 @@ class RegionalCollector:
         self, page: Page, context: BrowserContext, checker: BrowserLinkChecker,
         requested: date, displayed: date | None, region: str, region_order: int,
         issue_index: int, issue_total: int,
-    ) -> None:
+    ) -> bool:
         cards = await self._issue_cards(page)
         if issue_index >= len(cards):
             raise RuntimeError("지역 변경 후 이슈 카드 수가 달라졌습니다.")
@@ -554,7 +591,7 @@ class RegionalCollector:
                     "상세모달", requested, displayed, region=region, issue_order=issue_index + 1,
                     issue_title=issue["title"], event="모달 실패 화면 저장", screenshot_path=screenshot,
                 )
-            return
+            return False
         modal = await self._modal_from_close(close)
         source_heading = modal.locator("h3").filter(
             has_text=re.compile(r"^출처\s*\(\s*\d+\s*\)$")
@@ -579,6 +616,14 @@ class RegionalCollector:
         try:
             for source_order, (source_card, source_info) in enumerate(sources, 1):
                 self._raise_if_cancelled()
+                self.progress_reporter.emit(
+                    "link_started",
+                    f"출처 링크 {source_order}/{len(sources)} 확인 중",
+                    current_operation=(
+                        f"link_check:{requested.isoformat()}:{region}:"
+                        f"issue_{issue_index + 1}:source_{source_order}"
+                    ),
+                )
                 link_context = {
                     "requested_date": requested.isoformat(),
                     "displayed_date": displayed.isoformat() if displayed else "",
@@ -717,6 +762,7 @@ class RegionalCollector:
                 except Exception:
                     pass
                 await self._dismiss_header_overlay(page)
+        return True
 
     async def _modal_from_close(self, close: Locator) -> Locator:
         # 진단 HTML에는 role=dialog/aria-modal/id가 없다. 닫기 버튼에서 시작해

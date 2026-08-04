@@ -154,6 +154,10 @@ class AuditService:
             f"{run_stamp}{suffix}.xlsx"
         )
         excel_path: Path | None = None
+        reporter.emit(
+            "postprocessing_started", "결과 Excel을 생성합니다.",
+            current_operation="excel_generation",
+        )
         try:
             completed_region_units = len(checkpoint.completed)
             excel_path = write_excel(
@@ -182,6 +186,8 @@ class AuditService:
             error_count=sum(row.verdict != "정상" for row in checkpoint.rows),
             excel_path=str(excel_path or ""),
             error_message=error_message,
+            current_operation="",
+            operation_started_at="",
         )
         return AuditRunResult(
             status=status,

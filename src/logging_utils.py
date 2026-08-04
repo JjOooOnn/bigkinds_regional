@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import logging
+import json
 import re
+import sys
 from datetime import datetime
 from pathlib import Path
+from typing import TextIO
 
 from .models import DebugEntry
 
@@ -16,10 +19,43 @@ SENSITIVE_PATTERNS = [
     re.compile(r"(?i)(cookie|set-cookie|authorization)\s*[:=]\s*[^\r\n]+"),
     re.compile(r"(?i)(session(?:id)?|token)\s*[:=]\s*[^\s;,&]+"),
 ]
+SECRET_KEY_PATTERN = (
+    r"(?:access_token|api_?key|apikey|auth|authorization|cookie|jwt|password|"
+    r"secret|session(?:id)?|sid|token)"
+)
+QUOTED_SECRET_VALUE_PATTERN = re.compile(
+    rf'''(?ix)
+    (?P<prefix>["']?{SECRET_KEY_PATTERN}["']?\s*[:=]\s*)
+    (?P<quote>["'])
+    (?:\\.|(?!(?P=quote)).)*
+    (?P=quote)
+    '''
+)
+GENERIC_SECRET_VALUE_PATTERN = re.compile(
+    r'''(?ix)
+    (
+        ["']?
+        (?:access_token|api_?key|apikey|auth|authorization|cookie|jwt|password|
+           secret|session(?:id)?|sid|token)
+        ["']?\s*[:=]\s*
+    )
+    [^"'\s,;&#}]+
+    '''
+)
+BEARER_TOKEN_PATTERN = re.compile(r"(?i)(\bBearer\s+)[A-Za-z0-9._~+/=-]+")
 
 
 def sanitize(value: object) -> str:
     text = str(value or "")
+    text = QUOTED_SECRET_VALUE_PATTERN.sub(
+        lambda match: (
+            f"{match.group('prefix')}{match.group('quote')}"
+            f"[마스킹]{match.group('quote')}"
+        ),
+        text,
+    )
+    text = GENERIC_SECRET_VALUE_PATTERN.sub(r"\1[마스킹]", text)
+    text = BEARER_TOKEN_PATTERN.sub(r"\1[마스킹]", text)
     for pattern in SENSITIVE_PATTERNS:
         def replacement(match):
             prefix = match.group(1)
@@ -30,6 +66,32 @@ def sanitize(value: object) -> str:
             return f"{prefix}=[마스킹]"
         text = pattern.sub(replacement, text)
     return text[:8000]
+
+
+def configure_lifecycle_logging(stream: TextIO | None = None) -> logging.Logger:
+    logger = logging.getLogger("bigkinds_lifecycle")
+    logger.handlers.clear()
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    handler = logging.StreamHandler(stream or sys.stderr)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    logger.addHandler(handler)
+    return logger
+
+
+def log_lifecycle_event(
+    logger: logging.Logger,
+    component: str,
+    event: str,
+    **details: object,
+) -> None:
+    payload = {
+        "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "component": sanitize(component),
+        "event": sanitize(event),
+        **{key: sanitize(value) for key, value in details.items()},
+    }
+    logger.info("LIFECYCLE %s", json.dumps(payload, ensure_ascii=False, sort_keys=True))
 
 
 def setup_logging(log_path: Path) -> logging.Logger:

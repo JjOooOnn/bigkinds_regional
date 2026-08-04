@@ -4,7 +4,7 @@ import time
 from datetime import date
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 from playwright.async_api import async_playwright
 
@@ -157,9 +157,21 @@ class _Handler(BaseHTTPRequestHandler):
 class _Checkpoint:
     def __init__(self):
         self.debug_entries = []
+        self.rows = []
 
     def add_debug(self, entry):
         self.debug_entries.append(entry)
+
+    def mark_issue(self, *_args):
+        return None
+
+
+class _Reporter:
+    def __init__(self):
+        self.events = []
+
+    def emit(self, event, message="", **data):
+        self.events.append((event, message, data))
 
 
 def test_headless_context_uses_desktop_chromium_user_agent():
@@ -178,6 +190,45 @@ def test_browser_url_resolution_fallback_unescapes_entity_once():
             "https://www.bigkinds.or.kr/regional/curation.do",
         )
         assert result == "https://example.com/article?x=1&amp;ref=DA"
+
+    asyncio.run(scenario())
+
+
+def test_modal_open_failure_is_not_reported_as_issue_completed():
+    async def scenario():
+        checkpoint = _Checkpoint()
+        reporter = _Reporter()
+        collector = RegionalCollector(
+            start_date=date(2026, 7, 21), end_date=date(2026, 7, 21),
+            regions=["서울특별시"], headed=False, max_issues=None,
+            timeout_ms=1_000, retries=0, link_delay_ms=0,
+            checkpoint=checkpoint, logger=logging.getLogger("test"),
+            progress_reporter=reporter,
+        )
+        card = AsyncMock()
+        card.evaluate.return_value = {"title": "모달 실패 이슈", "categories": []}
+        close = AsyncMock()
+        close.wait_for.side_effect = RuntimeError("modal did not open")
+        page = Mock()
+        page.get_by_role.return_value = close
+        collector._issue_cards = AsyncMock(return_value=[card])
+        collector._save_screenshot = AsyncMock(return_value="")
+
+        issue_completed = await collector._audit_issue(
+            page, AsyncMock(), AsyncMock(), date(2026, 7, 21),
+            date(2026, 7, 21), "서울특별시", 0, 0, 1,
+        )
+        assert issue_completed is False
+
+        collector._select_region = AsyncMock(return_value=True)
+        collector._issue_cards = AsyncMock(return_value=[card])
+        collector._audit_issue = AsyncMock(return_value=False)
+        await collector._audit_region(
+            page, AsyncMock(), AsyncMock(), date(2026, 7, 21),
+            date(2026, 7, 21), "서울특별시", 0,
+        )
+        assert collector.had_partial_failures is True
+        assert all(event != "issue_completed" for event, _, _ in reporter.events)
 
     asyncio.run(scenario())
 

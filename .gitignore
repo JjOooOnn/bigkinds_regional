@@ -76,6 +76,8 @@ frontend/vite.config.d.ts
 *.xlsx
 *.xls
 /bigkinds_regional_link_audit*.csv
+/bigkinds_regional.zip
+/ICON-N-B(ico).ico
 
 # Manually generated diagnostic screenshots
 /ggilbo_*_mcp_*.png

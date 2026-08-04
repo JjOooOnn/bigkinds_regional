@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+import logging
+import os
 from pathlib import Path
 
 from fastapi import FastAPI, Request
@@ -12,6 +14,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from src.application.job_manager import JobManager
 from src.application.job_repository import JobRepository
 from src.config import ROOT_DIR, WORK_DIR
+from src.logging_utils import log_lifecycle_event, sanitize
 
 from .routes_jobs import router
 
@@ -32,11 +35,33 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
+        lifecycle_logger = logging.getLogger("bigkinds_lifecycle")
+        log_lifecycle_event(
+            lifecycle_logger, "api_server", "started", pid=os.getpid(),
+        )
         if owns_manager:
             repository.recover_interrupted_jobs()
-        yield
-        if owns_manager:
-            manager.shutdown()
+        termination_reason = "lifespan_shutdown"
+        try:
+            yield
+        except BaseException as exc:
+            termination_reason = type(exc).__name__
+            log_lifecycle_event(
+                lifecycle_logger, "api_server", "shutdown_error",
+                pid=os.getpid(), error=sanitize(exc),
+            )
+            raise
+        finally:
+            log_lifecycle_event(
+                lifecycle_logger, "api_server", "stopping",
+                pid=os.getpid(), termination_reason=termination_reason,
+            )
+            if owns_manager:
+                manager.shutdown()
+            log_lifecycle_event(
+                lifecycle_logger, "api_server", "stopped",
+                pid=os.getpid(), termination_reason=termination_reason,
+            )
 
     app = FastAPI(
         title="빅카인즈 링크 점검",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime
@@ -28,7 +29,25 @@ JOB_FIELDS = {
     "current_issue", "current_issue_order", "current_issue_total", "total_regions",
     "completed_regions", "total_region_units", "known_links", "processed_links",
     "normal_count", "error_count", "excel_path", "checkpoint_path", "log_path",
-    "error_message",
+    "error_message", "worker_pid", "worker_exit_code", "attempt_number",
+    "heartbeat_at", "last_progress_at", "current_operation",
+    "operation_started_at", "browser_state", "browser_restart_count",
+    "cancel_requested_at", "cancel_requested_by", "termination_reason",
+}
+
+OBSERVABILITY_COLUMNS = {
+    "worker_pid": "INTEGER",
+    "worker_exit_code": "INTEGER",
+    "attempt_number": "INTEGER NOT NULL DEFAULT 0",
+    "heartbeat_at": "TEXT NOT NULL DEFAULT ''",
+    "last_progress_at": "TEXT NOT NULL DEFAULT ''",
+    "current_operation": "TEXT NOT NULL DEFAULT ''",
+    "operation_started_at": "TEXT NOT NULL DEFAULT ''",
+    "browser_state": "TEXT NOT NULL DEFAULT 'not_started'",
+    "browser_restart_count": "INTEGER NOT NULL DEFAULT 0",
+    "cancel_requested_at": "TEXT NOT NULL DEFAULT ''",
+    "cancel_requested_by": "TEXT NOT NULL DEFAULT ''",
+    "termination_reason": "TEXT NOT NULL DEFAULT ''",
 }
 
 
@@ -45,6 +64,7 @@ class JobRepository:
 
     def __init__(self, db_path: Path):
         self.db_path = Path(db_path)
+        self.migration_backup_path: Path | None = None
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.initialize()
 
@@ -62,6 +82,27 @@ class JobRepository:
 
     def initialize(self) -> None:
         with self._connect() as connection:
+            jobs_table_exists = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'jobs'"
+            ).fetchone() is not None
+            existing_columns = (
+                {
+                    row["name"]
+                    for row in connection.execute("PRAGMA table_info(jobs)").fetchall()
+                }
+                if jobs_table_exists else set()
+            )
+            missing_columns = [
+                name for name in OBSERVABILITY_COLUMNS if name not in existing_columns
+            ]
+            if jobs_table_exists and missing_columns:
+                try:
+                    self.migration_backup_path = self._backup_before_migration(connection)
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"SQLite 마이그레이션 전 백업에 실패했습니다: {sanitize(exc)}"
+                    ) from exc
+
             connection.execute("PRAGMA journal_mode = WAL")
             connection.executescript(
                 """
@@ -97,7 +138,19 @@ class JobRepository:
                     excel_path TEXT NOT NULL DEFAULT '',
                     checkpoint_path TEXT NOT NULL DEFAULT '',
                     log_path TEXT NOT NULL DEFAULT '',
-                    error_message TEXT NOT NULL DEFAULT ''
+                    error_message TEXT NOT NULL DEFAULT '',
+                    worker_pid INTEGER,
+                    worker_exit_code INTEGER,
+                    attempt_number INTEGER NOT NULL DEFAULT 0,
+                    heartbeat_at TEXT NOT NULL DEFAULT '',
+                    last_progress_at TEXT NOT NULL DEFAULT '',
+                    current_operation TEXT NOT NULL DEFAULT '',
+                    operation_started_at TEXT NOT NULL DEFAULT '',
+                    browser_state TEXT NOT NULL DEFAULT 'not_started',
+                    browser_restart_count INTEGER NOT NULL DEFAULT 0,
+                    cancel_requested_at TEXT NOT NULL DEFAULT '',
+                    cancel_requested_by TEXT NOT NULL DEFAULT '',
+                    termination_reason TEXT NOT NULL DEFAULT ''
                 );
                 CREATE INDEX IF NOT EXISTS idx_jobs_created_at ON jobs(created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
@@ -130,6 +183,53 @@ class JobRepository:
                     ON job_results(job_id, link_working_yn, verdict, region);
                 """
             )
+            if jobs_table_exists and missing_columns:
+                try:
+                    connection.execute("BEGIN IMMEDIATE")
+                    for name in missing_columns:
+                        connection.execute(
+                            f"ALTER TABLE jobs ADD COLUMN {name} {OBSERVABILITY_COLUMNS[name]}"
+                        )
+                    connection.commit()
+                except Exception as exc:
+                    connection.rollback()
+                    raise RuntimeError(
+                        "SQLite 마이그레이션에 실패했습니다. "
+                        f"백업: {self.migration_backup_path}. 원인: {sanitize(exc)}"
+                    ) from exc
+
+    def _backup_before_migration(self, connection: sqlite3.Connection) -> Path:
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        backup_dir = self.db_path.parent / "backups" / (
+            f"{self.db_path.stem}_pre_migration_{stamp}"
+        )
+        backup_dir.mkdir(parents=True, exist_ok=False)
+        backup_db = backup_dir / self.db_path.name
+        with sqlite3.connect(backup_db) as backup_connection:
+            connection.backup(backup_connection)
+
+        copied_sidecars = []
+        for suffix in ("-wal", "-shm"):
+            source = self.db_path.with_name(f"{self.db_path.name}{suffix}")
+            if source.is_file():
+                destination = backup_dir / f"source-{self.db_path.name}{suffix}"
+                shutil.copy2(source, destination)
+                copied_sidecars.append(destination.name)
+
+        manifest = {
+            "created_at": now_iso(),
+            "source_database": str(self.db_path),
+            "restore_database": backup_db.name,
+            "source_sidecars": copied_sidecars,
+            "sidecar_note": (
+                "source- 접두사 파일은 진단 보존용입니다. 복구 시 서버를 중지하고 "
+                "restore_database만 원래 위치에 복원한 뒤 WAL/SHM은 SQLite가 다시 생성하게 하세요."
+            ),
+        }
+        (backup_dir / "backup_manifest.json").write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        return backup_dir
 
     def create_job(self, job_id: str, config: dict[str, Any], checkpoint_path: Path) -> dict[str, Any]:
         with self._connect() as connection:
@@ -191,7 +291,11 @@ class JobRepository:
         values = {key: value for key, value in fields.items() if key in JOB_FIELDS}
         if not values:
             return
-        for key in ("error_message", "current_issue", "current_region", "current_date"):
+        for key in (
+            "error_message", "current_issue", "current_region", "current_date",
+            "current_operation", "browser_state", "cancel_requested_by",
+            "termination_reason",
+        ):
             if key in values:
                 values[key] = sanitize(values[key])
         assignments = ", ".join(f"{key} = ?" for key in values)
@@ -201,19 +305,43 @@ class JobRepository:
                 (*values.values(), job_id),
             )
 
-    def mark_started(self, job_id: str) -> bool:
+    def mark_started(self, job_id: str, worker_pid: int) -> bool:
+        stamp = now_iso()
         with self._connect() as connection:
             cursor = connection.execute(
-                "UPDATE jobs SET status = 'running', started_at = ? WHERE job_id = ? AND status = 'queued'",
+                """
+                UPDATE jobs
+                SET status = 'running', started_at = ?, worker_pid = ?,
+                    attempt_number = attempt_number + 1, heartbeat_at = ?,
+                    current_operation = 'worker_starting', operation_started_at = ?,
+                    termination_reason = ''
+                WHERE job_id = ? AND status = 'queued'
+                """,
+                (stamp, worker_pid, stamp, stamp, job_id),
+            )
+        return cursor.rowcount == 1
+
+    def record_worker_spawned(self, job_id: str, worker_pid: int) -> None:
+        self.update_job(job_id, worker_pid=worker_pid)
+
+    def touch_heartbeat(self, job_id: str) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE jobs SET heartbeat_at = ? WHERE job_id = ? AND status IN ('running', 'cancel_requested')",
                 (now_iso(), job_id),
             )
         return cursor.rowcount == 1
 
-    def request_cancel(self, job_id: str) -> bool:
+    def request_cancel(self, job_id: str, requested_by: str = "api") -> bool:
+        stamp = now_iso()
         with self._connect() as connection:
             cursor = connection.execute(
-                "UPDATE jobs SET status = 'cancel_requested' WHERE job_id = ? AND status IN ('queued', 'running')",
-                (job_id,),
+                """
+                UPDATE jobs
+                SET status = 'cancel_requested', cancel_requested_at = ?, cancel_requested_by = ?
+                WHERE job_id = ? AND status IN ('queued', 'running')
+                """,
+                (stamp, sanitize(requested_by), job_id),
             )
         return cursor.rowcount == 1
 
@@ -356,8 +484,13 @@ class JobRepository:
                     status = "failed"
                     message = "서버가 재시작되어 대기 또는 실행 중이던 작업이 종료되었습니다."
                 connection.execute(
-                    "UPDATE jobs SET status = ?, ended_at = ?, error_message = ? WHERE job_id = ?",
+                    """
+                    UPDATE jobs
+                    SET status = ?, ended_at = ?, error_message = ?,
+                        current_operation = '', operation_started_at = '',
+                        termination_reason = 'server_restart'
+                    WHERE job_id = ?
+                    """,
                     (status, stamp, message, row["job_id"]),
                 )
         return len(rows)
-
