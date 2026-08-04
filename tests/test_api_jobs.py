@@ -62,6 +62,7 @@ def test_create_job_with_all_regions_and_read_status(api):
     assert job["heartbeat_at"] == ""
     assert job["regions"] == list(REGION_DISPLAY_ORDER)
     assert job["total_regions"] == 17
+    assert job["total_region_units"] == 17
     assert launched == [job["job_id"]]
     detail = client.get(f"/api/jobs/{job['job_id']}")
     assert detail.status_code == 200
@@ -74,6 +75,33 @@ def test_create_job_with_multiple_selected_regions(api):
     response = client.post("/api/jobs", json=payload(regions=selected))
     assert response.status_code == 201
     assert response.json()["regions"] == selected
+
+
+def test_job_status_returns_current_region_issue_and_article_progress(api):
+    client, repository, _ = api
+    job = client.post("/api/jobs", json=payload()).json()
+    repository.update_job(
+        job["job_id"],
+        current_date="2026-07-08",
+        current_region="충청북도",
+        current_region_completed_issues=2,
+        current_region_total_issues=5,
+        current_issue="집중호우 대응",
+        current_issue_order=3,
+        current_issue_total=5,
+        current_issue_processed_articles=4,
+        current_issue_total_articles=7,
+        current_publisher="테스트일보",
+        current_article_title="집중호우 대응 기사",
+    )
+
+    observed = client.get(f"/api/jobs/{job['job_id']}").json()
+    assert observed["current_region_completed_issues"] == 2
+    assert observed["current_region_total_issues"] == 5
+    assert observed["current_issue_processed_articles"] == 4
+    assert observed["current_issue_total_articles"] == 7
+    assert observed["current_publisher"] == "테스트일보"
+    assert observed["current_article_title"] == "집중호우 대응 기사"
 
 
 @pytest.mark.parametrize(

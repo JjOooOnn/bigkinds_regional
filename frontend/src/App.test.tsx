@@ -21,6 +21,9 @@ function baseJob(overrides = {}) {
     resume: false, resume_from_job_id: '', max_issues: null, timeout_seconds: 30, retries: 2,
     link_delay_seconds: 0.5, debug: false, status: 'queued', status_label: '대기', current_date: '',
     current_region: '', current_issue: '', current_issue_order: 0, current_issue_total: 0,
+    current_region_completed_issues: 0, current_region_total_issues: null,
+    current_issue_processed_articles: 0, current_issue_total_articles: null,
+    current_publisher: '', current_article_title: '',
     total_regions: 1, completed_regions: 0, total_region_units: 1, known_links: 0,
     processed_links: 0, normal_count: 0, error_count: 0, progress_percent: 0,
     download_available: false, excel_file_name: '', error_message: '', ...overrides,
@@ -83,6 +86,9 @@ describe('진행과 결과 화면', () => {
       current_region: '충청북도', current_issue: '산사태 위기경보', current_issue_order: 3,
       current_issue_total: 7, processed_links: 5, normal_count: 4, error_count: 1,
       completed_regions: 1, total_region_units: 2, progress_percent: 50,
+      current_region_completed_issues: 2, current_region_total_issues: 7,
+      current_issue_processed_articles: 3, current_issue_total_articles: 5,
+      current_publisher: '테스트일보', current_article_title: '산사태 위기경보 관련 기사',
     })
     vi.spyOn(globalThis, 'fetch').mockImplementation((input) => {
       const url = String(input)
@@ -95,7 +101,50 @@ describe('진행과 결과 화면', () => {
     render(<App />)
     expect(await screen.findByText('링크를 확인하고 있어요')).toBeInTheDocument()
     expect(screen.getByText('충청북도 · 3번째 이슈 확인 중')).toBeInTheDocument()
-    expect(screen.getByRole('progressbar')).toHaveAttribute('aria-valuenow', '50')
+    expect(screen.getByRole('progressbar', { name: '전체 일정' })).toHaveAttribute('aria-valuenow', '50')
+    expect(screen.getByRole('progressbar', { name: '현재 지역 이슈' })).toHaveAttribute('aria-valuenow', '29')
+    expect(screen.getByRole('progressbar', { name: '현재 이슈 기사' })).toHaveAttribute('aria-valuenow', '60')
+    expect(screen.getByText('테스트일보')).toBeInTheDocument()
+    expect(screen.getByText('산사태 위기경보 관련 기사')).toBeInTheDocument()
+  })
+
+  it('분모를 확인하기 전에는 하위 진행을 불확정 상태로 표시한다', async () => {
+    localStorage.setItem('bigkinds-current-job', 'job-1')
+    const running = baseJob({
+      status: 'running', status_label: '실행 중', current_date: '2026-07-08', current_region: '충청북도',
+    })
+    vi.spyOn(globalThis, 'fetch').mockImplementation((input) => {
+      const url = String(input)
+      if (url === '/api/config/regions') return json({ regions })
+      if (url === '/api/jobs') return json({ jobs: [running] })
+      if (url === '/api/jobs/job-1') return json(running)
+      if (url.endsWith('/logs')) return json({ logs: [] })
+      return json({})
+    })
+    render(<App />)
+    expect(await screen.findByRole('progressbar', { name: '현재 지역 이슈' })).not.toHaveAttribute('aria-valuenow')
+    expect(screen.getByRole('progressbar', { name: '현재 이슈 기사' })).toHaveAttribute('aria-valuetext', '목록 확인 중')
+    expect(screen.getAllByText('목록 확인 중')).toHaveLength(2)
+  })
+
+  it.each([
+    ['cancel_requested', '중단 요청', '중단 요청을 전달했어요'],
+    ['cancelling', '중단 처리 중', '현재 결과를 정리하고 있어요'],
+    ['force_terminating', '강제 종료 중', '작업 프로세스 종료를 기다리고 있어요'],
+  ])('취소 단계 %s를 구분해 표시한다', async (status, statusLabel, title) => {
+    localStorage.setItem('bigkinds-current-job', 'job-1')
+    const cancelling = baseJob({ status, status_label: statusLabel })
+    vi.spyOn(globalThis, 'fetch').mockImplementation((input) => {
+      const url = String(input)
+      if (url === '/api/config/regions') return json({ regions })
+      if (url === '/api/jobs') return json({ jobs: [cancelling] })
+      if (url === '/api/jobs/job-1') return json(cancelling)
+      if (url.endsWith('/logs')) return json({ logs: [] })
+      return json({})
+    })
+    render(<App />)
+    expect(await screen.findByRole('heading', { name: title })).toBeInTheDocument()
+    expect(screen.getByText(statusLabel)).toBeInTheDocument()
   })
 
   it('완료 결과에서 필터와 Excel 다운로드를 제공한다', async () => {

@@ -87,6 +87,42 @@ def test_observability_fields_distinguish_heartbeat_progress_and_cancel_source(t
     assert started["last_progress_at"] == ""
 
     reporter = SqliteProgressReporter(repository, job_id)
+    reporter.emit(
+        "region_started",
+        current_region="부산광역시",
+        current_region_completed_issues=0,
+        current_region_total_issues=None,
+        current_issue_processed_articles=0,
+        current_issue_total_articles=None,
+        current_publisher="",
+        current_article_title="",
+    )
+    reporter.emit(
+        "issue_started",
+        current_issue="테스트 이슈",
+        current_issue_order=1,
+        current_issue_total=3,
+        current_region_completed_issues=0,
+        current_region_total_issues=3,
+        current_issue_processed_articles=0,
+        current_issue_total_articles=None,
+    )
+    reporter.emit(
+        "link_started",
+        current_issue_processed_articles=1,
+        current_issue_total_articles=4,
+        current_publisher="테스트일보",
+        current_article_title="진행 중인 기사",
+        current_operation="link_check:test",
+    )
+    article_progress = repository.get_job(job_id)
+    assert article_progress["current_region_completed_issues"] == 0
+    assert article_progress["current_region_total_issues"] == 3
+    assert article_progress["current_issue_processed_articles"] == 1
+    assert article_progress["current_issue_total_articles"] == 4
+    assert article_progress["current_publisher"] == "테스트일보"
+    assert article_progress["current_article_title"] == "진행 중인 기사"
+
     reporter.emit("link_started", current_operation="link_check:test")
     in_progress = repository.get_job(job_id)
     assert in_progress["current_operation"] == "link_check:test"

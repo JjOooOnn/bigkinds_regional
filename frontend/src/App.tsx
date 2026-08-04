@@ -1,6 +1,6 @@
 import { FormEvent, useCallback, useEffect, useMemo, useState } from 'react'
 import { api } from './api'
-import type { AuditJob, JobLog, RegionOption, ResultResponse } from './types'
+import type { AuditJob, JobLog, JobStatus, RegionOption, ResultResponse } from './types'
 
 const CANCELLING = new Set(['cancel_requested', 'cancelling', 'force_terminating'])
 const ACTIVE = new Set(['queued', 'running', ...CANCELLING])
@@ -8,6 +8,20 @@ const RESUMABLE = new Set(['cancelled', 'partial_failed', 'failed'])
 const VERDICTS = ['링크오류', '접근제한', '서버오류', '타임아웃', '클릭오류', '빈화면', '확인필요']
 const STORAGE_KEY = 'bigkinds-current-job'
 const EMPTY_FILTERS = { verdict: '', region: '', publisher: '', title: '' }
+const CANCELLATION_COPY: Partial<Record<JobStatus, { title: string; detail: string }>> = {
+  cancel_requested: {
+    title: '중단 요청을 전달했어요',
+    detail: '현재 기사 작업이 안전한 지점에 도달하면 정리를 시작합니다.',
+  },
+  cancelling: {
+    title: '현재 결과를 정리하고 있어요',
+    detail: '완료된 체크포인트와 가능한 부분 결과를 보존합니다.',
+  },
+  force_terminating: {
+    title: '작업 프로세스 종료를 기다리고 있어요',
+    detail: '정리 제한시간을 넘긴 작업만 기록된 PID로 종료합니다.',
+  },
+}
 
 type Screen = 'setup' | 'history' | 'job'
 
@@ -33,6 +47,42 @@ function elapsed(job: AuditJob, tick: number): string {
   const minutes = Math.floor((seconds % 3600) / 60)
   const rest = seconds % 60
   return hours ? `${hours}시간 ${minutes}분` : minutes ? `${minutes}분 ${rest}초` : `${rest}초`
+}
+
+function ProgressStage({
+  label,
+  completed,
+  total,
+  scope,
+}: {
+  label: string
+  completed: number
+  total: number | null
+  scope: string
+}) {
+  const known = typeof total === 'number'
+  const percent = !known ? 0 : total === 0 ? 100 : Math.min(100, completed / total * 100)
+  const count = !known ? '목록 확인 중' : `${completed.toLocaleString()} / ${total.toLocaleString()}`
+  return (
+    <div className="progress-stage">
+      <div className="progress-copy">
+        <strong>{label}</strong>
+        <span>{count}</span>
+      </div>
+      <div
+        className={`progress-track${known ? '' : ' is-indeterminate'}`}
+        role="progressbar"
+        aria-label={label}
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={known ? Math.round(percent) : undefined}
+        aria-valuetext={known ? `${count}, ${Math.round(percent)}%` : '목록 확인 중'}
+      >
+        <span style={{ width: `${percent}%` }} />
+      </div>
+      <p className="progress-scope">{scope}</p>
+    </div>
+  )
 }
 
 function statusIcon(status: string): string {
@@ -262,6 +312,7 @@ function ProgressScreen({
   cancelling: boolean
   tick: number
 }) {
+  const cancellation = CANCELLATION_COPY[job.status]
   const detail = job.current_region
     ? `${job.current_region}${job.current_issue ? ` · ${job.current_issue_order || ''}번째 이슈 확인 중` : ' 점검 중'}`
     : '점검 환경을 준비하고 있어요'
@@ -270,22 +321,36 @@ function ProgressScreen({
       <section className="status-hero" aria-live="polite">
         <div className="pulse-mark" aria-hidden="true"><span /></div>
         <p className="eyebrow">{job.status_label}</p>
-        <h1>{CANCELLING.has(job.status) ? '안전하게 중단하고 있어요' : '링크를 확인하고 있어요'}</h1>
-        <p>{detail}</p>
-        {job.current_issue && <p className="current-issue-title">{job.current_issue}</p>}
+        <h1>{cancellation?.title ?? '링크를 확인하고 있어요'}</h1>
+        <p>{cancellation?.detail ?? detail}</p>
+        {!cancellation && job.current_issue && <p className="current-issue-title">{job.current_issue}</p>}
       </section>
 
       <section className="progress-card">
-        <div className="progress-copy">
-          <strong>전체 진행률</strong>
-          <span>{Math.round(job.progress_percent)}%</span>
-        </div>
-        <div className="progress-track" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(job.progress_percent)}>
-          <span style={{ width: `${job.progress_percent}%` }} />
-        </div>
-        <p className="muted">
-          완료 지역 일정 {job.completed_regions} / {job.total_region_units || job.total_regions}
-        </p>
+        <ProgressStage
+          label="전체 일정"
+          completed={job.completed_regions}
+          total={job.total_region_units || job.total_regions}
+          scope="완료 날짜×지역 / 전체 날짜×지역"
+        />
+        <ProgressStage
+          label="현재 지역 이슈"
+          completed={job.current_region_completed_issues}
+          total={job.current_region_total_issues}
+          scope="완료 이슈 / 현재 지역의 전체 이슈"
+        />
+        <ProgressStage
+          label="현재 이슈 기사"
+          completed={job.current_issue_processed_articles}
+          total={job.current_issue_total_articles}
+          scope="처리 기사 / 현재 이슈의 전체 기사"
+        />
+        {(job.current_publisher || job.current_article_title) && (
+          <p className="current-article">
+            <strong>{job.current_publisher || '언론사 확인 중'}</strong>
+            <span>{job.current_article_title || '기사 제목 확인 중'}</span>
+          </p>
+        )}
       </section>
 
       <section className="metric-grid" aria-label="점검 진행 수치">

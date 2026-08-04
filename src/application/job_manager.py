@@ -26,7 +26,10 @@ from .progress import CancellationToken, ProgressReporter
 class SqliteProgressReporter(ProgressReporter):
     PROGRESS_FIELDS = {
         "current_date", "current_region", "current_issue", "current_issue_order",
-        "current_issue_total", "total_regions", "completed_regions",
+        "current_issue_total", "current_region_completed_issues",
+        "current_region_total_issues", "current_issue_processed_articles",
+        "current_issue_total_articles", "current_publisher", "current_article_title",
+        "total_regions", "completed_regions",
         "total_region_units", "known_links", "processed_links", "normal_count",
         "error_count", "excel_path", "error_message",
     }

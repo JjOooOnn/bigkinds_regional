@@ -158,6 +158,12 @@ class RegionalCollector:
                     "audit_started", "링크 점검을 시작합니다.",
                     total_regions=len(selected_regions),
                     total_region_units=total_region_units,
+                    current_region_completed_issues=0,
+                    current_region_total_issues=None,
+                    current_issue_processed_articles=0,
+                    current_issue_total_articles=None,
+                    current_publisher="",
+                    current_article_title="",
                     processed_links=self.processed_links,
                     normal_count=self.normal_count,
                     error_count=self.error_count,
@@ -167,6 +173,16 @@ class RegionalCollector:
                     self.progress_reporter.emit(
                         "date_started", f"{requested.isoformat()} 점검을 시작합니다.",
                         current_date=requested.isoformat(),
+                        current_region="",
+                        current_issue="",
+                        current_issue_order=0,
+                        current_issue_total=0,
+                        current_region_completed_issues=0,
+                        current_region_total_issues=None,
+                        current_issue_processed_articles=0,
+                        current_issue_total_articles=None,
+                        current_publisher="",
+                        current_article_title="",
                     )
                     session = self._session
                     try:
@@ -209,6 +225,15 @@ class RegionalCollector:
                             current_date=requested.isoformat(), current_region=region,
                             completed_regions=self.completed_region_units,
                             total_region_units=total_region_units,
+                            current_issue="",
+                            current_issue_order=0,
+                            current_issue_total=0,
+                            current_region_completed_issues=0,
+                            current_region_total_issues=None,
+                            current_issue_processed_articles=0,
+                            current_issue_total_articles=None,
+                            current_publisher="",
+                            current_article_title="",
                         )
                         session = self._session
                         completed = await self._audit_region(
@@ -787,6 +812,18 @@ class RegionalCollector:
             cards = await self._issue_cards(page)
             if self.max_issues is not None:
                 cards = cards[: self.max_issues]
+            completed_issue_count = sum(
+                getattr(self.checkpoint, "issue_status", lambda *_args: "")(
+                    req, region, issue_index + 1,
+                ) == "completed"
+                for issue_index in range(len(cards))
+            )
+            self.progress_reporter.emit(
+                "region_issues_discovered", f"{region} 이슈 목록을 확인했습니다.",
+                current_date=requested.isoformat(), current_region=region,
+                current_region_completed_issues=completed_issue_count,
+                current_region_total_issues=len(cards),
+            )
             if not cards:
                 self.logger.info("[%s][%s] 데이터 없음", req, region)
                 return True
@@ -807,7 +844,7 @@ class RegionalCollector:
                 try:
                     issue_completed = await self._audit_issue(
                         page, context, checker, requested, displayed, region,
-                        region_order, issue_index, len(cards),
+                        region_order, issue_index, len(cards), completed_issue_count,
                     )
                     if not issue_completed:
                         self.had_partial_failures = True
@@ -817,9 +854,15 @@ class RegionalCollector:
                     self.progress_reporter.emit(
                         "issue_completed", f"이슈 {issue_index + 1}/{len(cards)} 확인 완료",
                         current_date=requested.isoformat(), current_region=region,
-                        current_issue_order=issue_index + 1, current_issue_total=len(cards),
+                        current_issue="", current_issue_order=0, current_issue_total=0,
+                        current_region_completed_issues=completed_issue_count + 1,
+                        current_region_total_issues=len(cards),
+                        current_issue_processed_articles=0,
+                        current_issue_total_articles=None,
+                        current_publisher="", current_article_title="",
                         current_operation="",
                     )
+                    completed_issue_count += 1
                     issue_index += 1
                 except AuditCancelled:
                     raise
@@ -862,7 +905,7 @@ class RegionalCollector:
     async def _audit_issue(
         self, page: Page, context: BrowserContext, checker: BrowserLinkChecker,
         requested: date, displayed: date | None, region: str, region_order: int,
-        issue_index: int, issue_total: int,
+        issue_index: int, issue_total: int, region_completed_issues: int = 0,
     ) -> bool:
         cards = await self._issue_cards(page)
         if issue_index >= len(cards):
@@ -878,6 +921,12 @@ class RegionalCollector:
             current_date=requested.isoformat(), current_region=region,
             current_issue=issue["title"], current_issue_order=issue_index + 1,
             current_issue_total=issue_total,
+            current_region_completed_issues=region_completed_issues,
+            current_region_total_issues=issue_total,
+            current_issue_processed_articles=0,
+            current_issue_total_articles=None,
+            current_publisher="",
+            current_article_title="",
         )
         self.issue_keys.add((requested.isoformat(), region, issue_index + 1))
         mark_started = getattr(self.checkpoint, "mark_issue_started", self.checkpoint.mark_issue)
@@ -911,6 +960,10 @@ class RegionalCollector:
         self.progress_reporter.emit(
             "links_discovered", f"출처 링크 {len(sources)}개를 확인합니다.",
             known_links=self.known_links,
+            current_issue_processed_articles=0,
+            current_issue_total_articles=len(sources),
+            current_publisher="",
+            current_article_title="",
         )
         if source_count != actual_card_count:
             self._debug("출처수집", requested, displayed, region=region, issue_order=issue_index + 1,
@@ -938,6 +991,10 @@ class RegionalCollector:
                 self.progress_reporter.emit(
                     "link_started",
                     f"출처 링크 {source_order}/{len(sources)} 확인 중",
+                    current_issue_processed_articles=source_order - 1,
+                    current_issue_total_articles=len(sources),
+                    current_publisher=source_info.publisher,
+                    current_article_title=source_info.title,
                     current_operation=(
                         f"link_check:{requested.isoformat()}:{region}:"
                         f"issue_{issue_index + 1}:source_{source_order}"
@@ -1035,6 +1092,10 @@ class RegionalCollector:
                     current_issue_total=issue_total, known_links=self.known_links,
                     processed_links=self.processed_links,
                     normal_count=self.normal_count, error_count=self.error_count,
+                    current_issue_processed_articles=source_order,
+                    current_issue_total_articles=len(sources),
+                    current_publisher=source_info.publisher,
+                    current_article_title=source_info.title,
                     verdict=result.verdict, current_operation="",
                     browser_state="running",
                     browser_restart_count=self.browser_restart_count,

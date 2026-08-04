@@ -4,7 +4,7 @@ import json
 import shutil
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -30,6 +30,9 @@ STATUS_LABELS = {
 JOB_FIELDS = {
     "started_at", "ended_at", "status", "current_date", "current_region",
     "current_issue", "current_issue_order", "current_issue_total", "total_regions",
+    "current_region_completed_issues", "current_region_total_issues",
+    "current_issue_processed_articles", "current_issue_total_articles",
+    "current_publisher", "current_article_title",
     "completed_regions", "total_region_units", "known_links", "processed_links",
     "normal_count", "error_count", "excel_path", "checkpoint_path", "log_path",
     "error_message", "worker_pid", "worker_exit_code", "attempt_number",
@@ -39,6 +42,12 @@ JOB_FIELDS = {
 }
 
 OBSERVABILITY_COLUMNS = {
+    "current_region_completed_issues": "INTEGER NOT NULL DEFAULT 0",
+    "current_region_total_issues": "INTEGER",
+    "current_issue_processed_articles": "INTEGER NOT NULL DEFAULT 0",
+    "current_issue_total_articles": "INTEGER",
+    "current_publisher": "TEXT NOT NULL DEFAULT ''",
+    "current_article_title": "TEXT NOT NULL DEFAULT ''",
     "worker_pid": "INTEGER",
     "worker_exit_code": "INTEGER",
     "attempt_number": "INTEGER NOT NULL DEFAULT 0",
@@ -131,6 +140,12 @@ class JobRepository:
                     current_issue TEXT NOT NULL DEFAULT '',
                     current_issue_order INTEGER NOT NULL DEFAULT 0,
                     current_issue_total INTEGER NOT NULL DEFAULT 0,
+                    current_region_completed_issues INTEGER NOT NULL DEFAULT 0,
+                    current_region_total_issues INTEGER,
+                    current_issue_processed_articles INTEGER NOT NULL DEFAULT 0,
+                    current_issue_total_articles INTEGER,
+                    current_publisher TEXT NOT NULL DEFAULT '',
+                    current_article_title TEXT NOT NULL DEFAULT '',
                     total_regions INTEGER NOT NULL DEFAULT 0,
                     completed_regions INTEGER NOT NULL DEFAULT 0,
                     total_region_units INTEGER NOT NULL DEFAULT 0,
@@ -235,6 +250,9 @@ class JobRepository:
         return backup_dir
 
     def create_job(self, job_id: str, config: dict[str, Any], checkpoint_path: Path) -> dict[str, Any]:
+        total_region_units = (
+            (date.fromisoformat(config["end_date"]) - date.fromisoformat(config["start_date"])).days + 1
+        ) * len(config["regions"])
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             active = connection.execute(
@@ -248,8 +266,8 @@ class JobRepository:
                 INSERT INTO jobs (
                     job_id, created_at, start_date, end_date, regions_json, headed, resume,
                     resume_from_job_id, max_issues, timeout_seconds, retries,
-                    link_delay_seconds, debug, status, total_regions, checkpoint_path
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
+                    link_delay_seconds, debug, status, total_regions, total_region_units, checkpoint_path
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)
                 """,
                 (
                     job_id, now_iso(), config["start_date"], config["end_date"],
@@ -257,7 +275,8 @@ class JobRepository:
                     int(config.get("resume", False)), config.get("resume_from_job_id", ""),
                     config.get("max_issues"), config.get("timeout_seconds", 30),
                     config.get("retries", 2), config.get("link_delay_seconds", 0.5),
-                    int(config.get("debug", False)), len(config["regions"]), str(checkpoint_path),
+                    int(config.get("debug", False)), len(config["regions"]), total_region_units,
+                    str(checkpoint_path),
                 ),
             )
         return self.get_job(job_id)  # type: ignore[return-value]
@@ -296,7 +315,8 @@ class JobRepository:
             return
         for key in (
             "error_message", "current_issue", "current_region", "current_date",
-            "current_operation", "browser_state", "cancel_requested_by",
+            "current_publisher", "current_article_title", "current_operation",
+            "browser_state", "cancel_requested_by",
             "termination_reason",
         ):
             if key in values:

@@ -37,6 +37,12 @@ export interface AuditJob {
   current_issue: string
   current_issue_order: number
   current_issue_total: number
+  current_region_completed_issues: number
+  current_region_total_issues: number | null
+  current_issue_processed_articles: number
+  current_issue_total_articles: number | null
+  current_publisher: string
+  current_article_title: string
   total_regions: number
   completed_regions: number
   total_region_units: number
