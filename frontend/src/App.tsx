@@ -6,6 +6,16 @@ const CANCELLING = new Set(['cancel_requested', 'cancelling', 'force_terminating
 const ACTIVE = new Set(['queued', 'running', ...CANCELLING])
 const RESUMABLE = new Set(['partial_failed', 'failed'])
 const VERDICTS = ['링크오류', '접근제한', '서버오류', '타임아웃', '클릭오류', '빈화면', '확인필요']
+const VERDICT_BADGE_CLASSES: Partial<Record<string, string>> = {
+  링크오류: 'verdict-badge-link-error',
+  확인필요: 'verdict-badge-review',
+}
+const RESULT_TITLES: Partial<Record<JobStatus, string>> = {
+  completed: '점검이 완료됐어요',
+  partial_failed: '일부 점검 결과를 확인해 주세요',
+  failed: '점검을 완료하지 못했어요',
+  cancelled: '중단된 작업 결과예요',
+}
 const STORAGE_KEY = 'bigkinds-current-job'
 const EMPTY_FILTERS = { verdict: '', region: '', publisher: '', title: '' }
 const CANCELLATION_COPY: Partial<Record<JobStatus, { title: string; detail: string }>> = {
@@ -411,7 +421,7 @@ function ResultsScreen({
     normal_rate: job.processed_links ? job.normal_count / job.processed_links : 0,
     verdict_counts: {},
   }
-  const completeTitle = job.status === 'completed' ? '점검이 완료됐어요' : `${job.status_label} 작업 결과예요`
+  const completeTitle = RESULT_TITLES[job.status] ?? `${job.status_label} 작업 결과예요`
   return (
     <main className="page results-page">
       <section className="result-hero">
@@ -470,7 +480,7 @@ function ResultsScreen({
           <div className="error-list">
             {results.errors.map((item, index) => (
               <article className="error-card" key={`${item.original_url}-${index}`}>
-                <div className="error-meta"><span>{item.requested_date}</span><span>{item.region}</span><span>{item.publisher || '언론사 미확인'}</span><span className="verdict-badge">{item.verdict}</span></div>
+                <div className="error-meta"><span>{item.requested_date}</span><span>{item.region}</span><span>{item.publisher || '언론사 미확인'}</span><span className={`verdict-badge ${VERDICT_BADGE_CLASSES[item.verdict] ?? ''}`}>{item.verdict}</span></div>
                 <h3>{item.article_title || '기사제목 미확인'}</h3>
                 <p className="error-message">{item.error_message || '정상 기사 화면을 확인하지 못했습니다.'}</p>
                 <dl>

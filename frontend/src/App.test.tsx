@@ -101,6 +101,34 @@ describe('점검 설정 화면', () => {
     fireEvent.click(screen.getByRole('button', { name: '점검 시작' }))
     expect(await screen.findByText('이미 실행 중인 작업이 있습니다.')).toBeInTheDocument()
   })
+
+  it.each([
+    ['partial_failed', '일부 실패', '일부 점검 결과를 확인해 주세요'],
+    ['failed', '실패', '점검을 완료하지 못했어요'],
+    ['cancelled', '중단됨', '중단된 작업 결과예요'],
+  ])('%s 작업의 결과 제목을 자연스러운 문장으로 표시한다', async (status, statusLabel, title) => {
+    localStorage.setItem('bigkinds-current-job', 'job-1')
+    const job = baseJob({ status, status_label: statusLabel, ended_at: '2026-07-20T09:01:00+09:00' })
+    vi.spyOn(globalThis, 'fetch').mockImplementation((input) => {
+      const url = String(input)
+      if (url === '/api/config/regions') return json({ regions })
+      if (url === '/api/jobs') return json({ jobs: [job] })
+      if (url === '/api/jobs/job-1') return json(job)
+      if (url.endsWith('/logs')) return json({ logs: [] })
+      if (url.includes('/results')) {
+        return json({
+          summary: { total_links: 0, normal_count: 0, error_count: 0, normal_rate: 0, verdict_counts: {} },
+          total_errors: 0,
+          errors: [],
+        })
+      }
+      return json({})
+    })
+
+    render(<App />)
+
+    expect(await screen.findByRole('heading', { name: title })).toBeInTheDocument()
+  })
 })
 
 describe('진행과 결과 화면', () => {
@@ -196,9 +224,34 @@ describe('진행과 결과 화면', () => {
     render(<App />)
     expect(await screen.findByText('점검이 완료됐어요')).toBeInTheDocument()
     expect(await screen.findByText('없는 기사')).toBeInTheDocument()
+    expect(screen.getByText('링크오류', { selector: '.verdict-badge' })).toHaveClass('verdict-badge-link-error')
     expect(screen.getByRole('link', { name: 'Excel 다운로드' })).toHaveAttribute('href', '/api/jobs/job-1/download')
     fireEvent.change(screen.getByLabelText('언론사명'), { target: { value: '테스트' } })
     fireEvent.click(screen.getByRole('button', { name: '필터 적용' }))
     await waitFor(() => expect(fetchMock.mock.calls.some(([url]) => String(url).includes('publisher=%ED%85%8C%EC%8A%A4%ED%8A%B8'))).toBe(true))
+  })
+
+  it('확인필요 배지에 경고 스타일 클래스를 적용한다', async () => {
+    localStorage.setItem('bigkinds-current-job', 'job-1')
+    const completed = baseJob({ status: 'completed', status_label: '완료', ended_at: '2026-07-20T09:01:00+09:00' })
+    vi.spyOn(globalThis, 'fetch').mockImplementation((input) => {
+      const url = String(input)
+      if (url === '/api/config/regions') return json({ regions })
+      if (url === '/api/jobs') return json({ jobs: [completed] })
+      if (url === '/api/jobs/job-1') return json(completed)
+      if (url.endsWith('/logs')) return json({ logs: [] })
+      if (url.includes('/results')) {
+        return json({
+          summary: { total_links: 1, normal_count: 0, error_count: 1, normal_rate: 0, verdict_counts: { 확인필요: 1 } },
+          total_errors: 1,
+          errors: [{ requested_date: '2026-07-08', region: '충청북도', publisher: '테스트일보', article_title: '확인 대상 기사', link_working_yn: 'N', verdict: '확인필요', error_message: '기사 확인 필요', original_url: 'https://example.com/original', final_url: 'https://example.com/final', http_status: 200 }],
+        })
+      }
+      return json({})
+    })
+
+    render(<App />)
+
+    expect(await screen.findByText('확인필요', { selector: '.verdict-badge' })).toHaveClass('verdict-badge-review')
   })
 })

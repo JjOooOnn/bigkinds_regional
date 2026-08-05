@@ -112,7 +112,7 @@ input:focus, select:focus { border-color: var(--blue); background: #fff; }
 .global-error button { border: 0; background: none; cursor: pointer; font-size: 20px; }
 
 .status-hero { text-align: center; margin-bottom: 38px; }
-.status-hero .current-issue-title { max-width: 680px; margin: 8px auto 0; color: #3f4b60; font-size: 15px; overflow-wrap: anywhere; }
+.status-hero .current-issue-title { max-width: 680px; margin: 8px auto 0; color: #3f4b60; font-size: 15px; overflow-wrap: anywhere; text-align: center; }
 .pulse-mark { width: 72px; height: 72px; display: grid; place-items: center; margin: 0 auto 20px; border-radius: 24px; background: var(--blue-soft); }
 .pulse-mark span { width: 18px; height: 18px; border-radius: 50%; background: var(--blue); animation: pulse 1.6s ease-out infinite; }
 @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(37,99,235,.35); } 70%, 100% { box-shadow: 0 0 0 18px rgba(37,99,235,0); } }
@@ -170,6 +170,8 @@ input:focus, select:focus { border-color: var(--blue); background: #fff; }
 .error-card { border: 1px solid var(--line); border-radius: 18px; padding: 21px; }
 .error-meta { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; color: var(--muted); font-size: 13px; }
 .error-meta .verdict-badge { color: #8a5423; background: #fff4e6; }
+.error-meta .verdict-badge-link-error { color: var(--danger); background: #fff0f0; }
+.error-meta .verdict-badge-review { color: #8a5423; background: #fff4e6; }
 .error-card h3 { margin: 13px 0 8px; font-size: 18px; line-height: 1.5; overflow-wrap: anywhere; }
 .error-message { color: #7d4d4d; margin: 0 0 14px; }
 .error-card dl { margin: 0; display: grid; gap: 7px; }
