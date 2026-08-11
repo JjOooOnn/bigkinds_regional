@@ -112,7 +112,7 @@ input:focus, select:focus { border-color: var(--blue); background: #fff; }
 .global-error button { border: 0; background: none; cursor: pointer; font-size: 20px; }
 
 .status-hero { text-align: center; margin-bottom: 38px; }
-.status-hero .current-issue-title { max-width: 680px; margin: 8px auto 0; color: #3f4b60; font-size: 15px; overflow-wrap: anywhere; text-align: center; }
+.status-hero > p.current-issue-title { max-width: 680px; margin: 8px auto 0; color: #3f4b60; font-size: 15px; overflow-wrap: anywhere; text-align: center; }
 .pulse-mark { width: 72px; height: 72px; display: grid; place-items: center; margin: 0 auto 20px; border-radius: 24px; background: var(--blue-soft); }
 .pulse-mark span { width: 18px; height: 18px; border-radius: 50%; background: var(--blue); animation: pulse 1.6s ease-out infinite; }
 @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(37,99,235,.35); } 70%, 100% { box-shadow: 0 0 0 18px rgba(37,99,235,0); } }
@@ -135,6 +135,7 @@ input:focus, select:focus { border-color: var(--blue); background: #fff; }
 .metric-grid > div, .summary-grid > div { padding: 18px; border-radius: 18px; background: white; box-shadow: var(--shadow); }
 .metric-grid span, .summary-grid span { display: block; color: var(--muted); font-size: 13px; margin-bottom: 8px; }
 .metric-grid strong, .summary-grid strong { font-size: 20px; }
+.current-date-metric strong { font-size: 18px; white-space: nowrap; }
 .metric-grid small { display: block; color: var(--muted); margin-top: 5px; font-size: 11px; }
 .positive { color: var(--success); }
 .log-panel { max-width: 760px; margin: 0 auto; }

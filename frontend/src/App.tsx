@@ -366,7 +366,7 @@ function ProgressScreen({
       </section>
 
       <section className="metric-grid" aria-label="점검 진행 수치">
-        <div><span>현재 날짜</span><strong>{job.current_date || '-'}</strong></div>
+        <div className="current-date-metric"><span>현재 날짜</span><strong>{job.current_date || '-'}</strong></div>
         <div><span>처리한 링크</span><strong>{job.processed_links.toLocaleString()}</strong><small>현재 확인 {job.known_links.toLocaleString()}개</small></div>
         <div><span>정상</span><strong className="positive">{job.normal_count.toLocaleString()}</strong></div>
         <div><span>확인 필요</span><strong>{job.error_count.toLocaleString()}</strong></div>
