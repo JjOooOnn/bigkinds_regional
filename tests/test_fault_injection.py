@@ -168,13 +168,15 @@ def test_browser_lifecycle_events_record_page_and_browser_states():
 
     collector._track_page_lifecycle(page, "검사 page")
     collector._track_browser_lifecycle(browser)
+    callbacks["page:crash"](page)
     callbacks["page:close"](page)
     callbacks["browser:disconnected"](browser)
 
+    assert page in collector._crashed_pages
     assert page in collector._unexpected_closed_pages
     assert browser in collector._disconnected_browsers
     states = [data["browser_state"] for _, _, data in reporter.events]
-    assert states == ["page_closed", "disconnected"]
+    assert states == ["page_crashed", "page_closed", "disconnected"]
 
 
 def test_browser_failure_classification_uses_live_state_before_error_text():
@@ -201,6 +203,117 @@ def test_browser_failure_classification_uses_live_state_before_error_text():
     assert disconnected is not None
     assert disconnected.state == "disconnected"
     assert not disconnected.inspection_page_only
+
+
+def test_browser_failure_classification_distinguishes_crashed_pages():
+    collector = _collector()
+    browser = Mock()
+    browser.is_connected.return_value = True
+    context = Mock(browser=browser)
+    source_page = Mock()
+    source_page.is_closed.return_value = False
+    inspection_page = Mock()
+    inspection_page.is_closed.return_value = False
+
+    collector._crashed_pages.add(source_page)
+    source_failure = collector._browser_session_failure(
+        source_page, context, RuntimeError("opaque failure"), target=inspection_page,
+    )
+    assert source_failure is not None
+    assert source_failure.state == "page_crashed"
+    assert not source_failure.inspection_page_only
+
+    collector._crashed_pages.clear()
+    collector._crashed_pages.add(inspection_page)
+    inspection_failure = collector._browser_session_failure(
+        source_page, context, RuntimeError("opaque failure"), target=inspection_page,
+    )
+    assert inspection_failure is not None
+    assert inspection_failure.state == "page_crashed"
+    assert inspection_failure.inspection_page_only
+
+
+def test_target_crashed_message_is_a_page_failure_fallback():
+    collector = _collector()
+    browser = Mock()
+    browser.is_connected.return_value = True
+    context = Mock(browser=browser)
+    source_page = Mock()
+    source_page.is_closed.return_value = False
+
+    failure = collector._browser_session_failure(
+        source_page, context, RuntimeError("Locator.inner_text: Target crashed"),
+    )
+
+    assert failure is not None
+    assert failure.state == "page_crashed"
+    assert not failure.inspection_page_only
+
+
+def test_region_selection_crash_recovers_and_retries_the_same_region():
+    collector = _collector()
+    collector._debug = Mock()
+    requested = date(2026, 7, 30)
+    old_page, old_context = Mock(), Mock()
+    replacement_page, replacement_context = Mock(), Mock()
+    collector._session = SimpleNamespace(
+        browser=Mock(), context=old_context, page=old_page,
+    )
+    collector._select_region = AsyncMock(
+        side_effect=[RuntimeError("Locator.inner_text: Target crashed"), True],
+    )
+    collector._issue_cards = AsyncMock(return_value=[])
+
+    async def recover(_failure, _requested, _region):
+        collector._session = SimpleNamespace(
+            browser=Mock(), context=replacement_context, page=replacement_page,
+        )
+        return True
+
+    collector._recover_browser_session = AsyncMock(side_effect=recover)
+
+    completed = asyncio.run(
+        collector._audit_region(
+            old_page, old_context, AsyncMock(), requested, requested,
+            "부산광역시", 0,
+        )
+    )
+
+    assert completed
+    assert collector._select_region.await_count == 2
+    collector._recover_browser_session.assert_awaited_once()
+    collector._issue_cards.assert_awaited_once_with(replacement_page)
+
+
+def test_fatal_region_browser_failure_stops_before_the_next_region():
+    collector = _collector()
+    requested = date(2026, 7, 30)
+    regions = ["부산광역시", "대구광역시"]
+    collector.requested_regions = regions
+    collector.checkpoint.completed = set()
+    collector.checkpoint.mark_completed = Mock()
+    session = SimpleNamespace(browser=Mock(), context=Mock(), page=Mock())
+    collector._create_browser_session = AsyncMock(return_value=session)
+    collector._read_regions = AsyncMock(return_value=regions)
+    collector._select_requested_regions = Mock(return_value=regions)
+    failure = BrowserSessionFailure("page_crashed", "Target crashed")
+    collector._audit_region = AsyncMock(side_effect=failure)
+    collector._cleanup_browser_resources = AsyncMock()
+    playwright = Mock()
+    playwright.stop = AsyncMock()
+    starter = Mock()
+    starter.start = AsyncMock(return_value=playwright)
+    navigator = Mock()
+    navigator.move_to = AsyncMock(return_value=(True, requested))
+
+    with (
+        patch("src.regional_collector.async_playwright", return_value=starter),
+        patch("src.regional_collector.DateNavigator", return_value=navigator),
+        pytest.raises(BrowserSessionFailure),
+    ):
+        asyncio.run(collector.run())
+
+    assert collector._audit_region.await_count == 1
 
 
 def test_recovery_is_limited_per_article_and_per_job():
@@ -285,6 +398,148 @@ def test_main_page_recovery_restores_requested_date_and_region():
     replacement_page.goto.assert_awaited_once()
     navigator.move_to.assert_awaited_once_with(requested, retries=1)
     collector._select_region.assert_awaited_once_with(replacement_page, "부산광역시")
+
+
+def test_crashed_main_page_recovery_reuses_the_existing_context():
+    collector = _collector()
+    requested = date(2026, 7, 30)
+    old_playwright = Mock()
+    old_playwright.stop = AsyncMock()
+    old_page = Mock()
+    old_page.is_closed.return_value = True
+    context = Mock()
+    replacement_page = AsyncMock()
+    context.new_page = AsyncMock(return_value=replacement_page)
+    old_session = SimpleNamespace(browser=Mock(), context=context, page=old_page)
+    unexpected_session = SimpleNamespace(browser=Mock(), context=Mock(), page=Mock())
+    collector._playwright = old_playwright
+    collector._session = old_session
+    collector._track_page_lifecycle = Mock()
+    collector._cleanup_browser_resources = AsyncMock()
+    collector._create_browser_session = AsyncMock(return_value=unexpected_session)
+    collector._select_region = AsyncMock(return_value=True)
+    new_playwright = Mock()
+    starter = Mock()
+    starter.start = AsyncMock(return_value=new_playwright)
+    navigator = Mock()
+    navigator.move_to = AsyncMock(return_value=(True, requested))
+
+    failure = BrowserSessionFailure("page_crashed", "Target crashed")
+    with (
+        patch("src.regional_collector.async_playwright", return_value=starter),
+        patch("src.regional_collector.DateNavigator", return_value=navigator),
+    ):
+        recovered = asyncio.run(
+            collector._recover_browser_session(failure, requested, "부산광역시")
+        )
+
+    assert recovered
+    assert collector._session is old_session
+    assert collector._session.page is replacement_page
+    context.new_page.assert_awaited_once()
+    starter.start.assert_not_awaited()
+    collector._create_browser_session.assert_not_awaited()
+    assert collector.browser_restart_count == 1
+
+
+def test_crashed_main_page_falls_back_to_full_session_recovery():
+    collector = _collector()
+    requested = date(2026, 7, 30)
+    old_playwright = Mock()
+    old_playwright.stop = AsyncMock()
+    old_page = Mock()
+    old_page.is_closed.return_value = True
+    old_context = Mock()
+    old_context.new_page = AsyncMock(side_effect=RuntimeError("renderer unavailable"))
+    old_session = SimpleNamespace(browser=Mock(), context=old_context, page=old_page)
+    replacement_session = SimpleNamespace(browser=Mock(), context=Mock(), page=Mock())
+    new_playwright = Mock()
+    starter = Mock()
+    starter.start = AsyncMock(return_value=new_playwright)
+
+    collector._playwright = old_playwright
+    collector._session = old_session
+    collector._cleanup_browser_resources = AsyncMock()
+
+    async def bounded_cleanup(awaitable, _label):
+        await awaitable
+        return True
+
+    collector._bounded_cleanup = AsyncMock(side_effect=bounded_cleanup)
+    collector._create_browser_session = AsyncMock(return_value=replacement_session)
+    collector._select_region = AsyncMock(return_value=True)
+    navigator = Mock()
+    navigator.move_to = AsyncMock(return_value=(True, requested))
+
+    failure = BrowserSessionFailure("page_crashed", "Target crashed")
+    with (
+        patch("src.regional_collector.async_playwright", return_value=starter),
+        patch("src.regional_collector.DateNavigator", return_value=navigator),
+    ):
+        recovered = asyncio.run(
+            collector._recover_browser_session(failure, requested, "부산광역시")
+        )
+
+    assert recovered
+    old_context.new_page.assert_awaited_once()
+    collector._cleanup_browser_resources.assert_awaited_once_with(
+        old_session.context, old_session.browser,
+    )
+    starter.start.assert_awaited_once()
+    collector._create_browser_session.assert_awaited_once()
+    assert collector._playwright is new_playwright
+    assert collector._session is replacement_session
+    assert collector.browser_restart_count == 1
+
+
+def test_main_page_position_restore_failure_falls_back_to_full_session_recovery():
+    collector = _collector()
+    requested = date(2026, 7, 30)
+    old_playwright = Mock()
+    old_playwright.stop = AsyncMock()
+    old_page = Mock()
+    old_page.is_closed.return_value = True
+    old_context = Mock()
+    old_context.new_page = AsyncMock(return_value=AsyncMock())
+    old_session = SimpleNamespace(browser=Mock(), context=old_context, page=old_page)
+    replacement_session = SimpleNamespace(browser=Mock(), context=Mock(), page=Mock())
+    new_playwright = Mock()
+    starter = Mock()
+    starter.start = AsyncMock(return_value=new_playwright)
+
+    collector._playwright = old_playwright
+    collector._session = old_session
+    collector._track_page_lifecycle = Mock()
+    collector._cleanup_browser_resources = AsyncMock()
+
+    async def bounded_cleanup(awaitable, _label):
+        await awaitable
+        return True
+
+    collector._bounded_cleanup = AsyncMock(side_effect=bounded_cleanup)
+    collector._create_browser_session = AsyncMock(return_value=replacement_session)
+    collector._select_region = AsyncMock(return_value=True)
+    navigator = Mock()
+    navigator.move_to = AsyncMock(
+        side_effect=[(False, requested), (True, requested)],
+    )
+
+    failure = BrowserSessionFailure("page_crashed", "Target crashed")
+    with (
+        patch("src.regional_collector.async_playwright", return_value=starter),
+        patch("src.regional_collector.DateNavigator", return_value=navigator),
+    ):
+        recovered = asyncio.run(
+            collector._recover_browser_session(failure, requested, "부산광역시")
+        )
+
+    assert recovered
+    old_context.new_page.assert_awaited_once()
+    assert navigator.move_to.await_count == 2
+    starter.start.assert_awaited_once()
+    collector._create_browser_session.assert_awaited_once()
+    assert collector._session is replacement_session
+    assert collector.browser_restart_count == 1
 
 
 def test_disconnected_browser_recovery_recreates_playwright_and_session():

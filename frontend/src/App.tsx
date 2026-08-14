@@ -1,4 +1,5 @@
 import { FormEvent, useCallback, useEffect, useMemo, useState } from 'react'
+import packageInfo from '../package.json'
 import { api } from './api'
 import type { AuditJob, JobLog, JobStatus, RegionOption, ResultResponse } from './types'
 
@@ -662,7 +663,7 @@ export default function App() {
         : <ResultsScreen job={job} results={results} regions={regions} filters={filters} onFilters={setFilters} onApplyFilters={() => void loadResults(job.job_id, filters)} loading={loadingResults} />)}
       {screen === 'job' && !job && <main className="page"><EmptyState>작업 정보를 불러오고 있습니다.</EmptyState></main>}
 
-      <footer>모든 데이터는 이 PC에만 저장됩니다 · 외부 로그인이나 클라우드 저장소를 사용하지 않습니다.</footer>
+      <footer>모든 데이터는 이 PC에만 저장됩니다 · 외부 로그인이나 클라우드 저장소를 사용하지 않습니다. · 버전 v{packageInfo.version}</footer>
     </div>
   )
 }

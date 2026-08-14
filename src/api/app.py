@@ -15,6 +15,7 @@ from src.application.job_manager import JobManager
 from src.application.job_repository import JobRepository
 from src.config import ROOT_DIR, WORK_DIR
 from src.logging_utils import log_lifecycle_event, sanitize
+from src.version import read_app_version
 
 from .routes_jobs import router
 
@@ -65,7 +66,7 @@ def create_app(
 
     app = FastAPI(
         title="빅카인즈 링크 점검",
-        version="1.0.0",
+        version=read_app_version(),
         lifespan=lifespan,
     )
     app.state.job_repository = repository

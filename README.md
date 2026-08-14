@@ -264,6 +264,37 @@ npm run build
 cd ..
 ```
 
+## 버전과 커밋 제목
+
+제품 버전의 단일 기준은 `frontend/package.json`의 `version`입니다. 현재 제품 버전은 화면에는 `v1.0.1`처럼 표시되고, FastAPI OpenAPI에도 같은 값으로 노출됩니다. 버전은 Semantic Versioning을 따릅니다.
+
+- 호환성이 깨지는 변경: `major`
+- 사용자 기능 추가: `minor`
+- 버그 수정·UI·문서 변경: `patch`
+
+새 배포 작업을 시작할 때 버전을 올리고, `package.json`과 `package-lock.json`을 함께 갱신합니다.
+
+```powershell
+cd frontend
+npm.cmd version patch --no-git-tag-version
+cd ..
+```
+
+모든 커밋 제목은 현재 제품 버전을 포함해야 합니다. 허용되는 type은 `feat`, `fix`, `docs`, `test`, `refactor`, `chore`입니다.
+
+```text
+[v1.0.1] fix: Target crashed 복구
+[v1.0.1] docs: 버전 규칙 문서화
+```
+
+저장소를 처음 준비한 뒤에는 다음 명령으로 프로젝트 hook을 활성화합니다. 이 설정은 각 개발 환경의 로컬 Git 설정에 저장됩니다.
+
+```powershell
+git config core.hooksPath .githooks
+```
+
+일반 `git commit` 시 hook이 `frontend/package.json`의 버전과 제목의 버전이 일치하는지 검사합니다. 규칙을 위반하면 커밋은 생성되지 않고 올바른 제목 형식이 안내됩니다.
+
 실제 사이트를 소규모로 확인하려면 현재 지원되는 `--max-issues` 옵션을 사용합니다.
 
 ```powershell

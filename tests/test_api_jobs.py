@@ -11,6 +11,7 @@ from src.api.app import create_app
 from src.application.job_manager import JobManager
 from src.application.job_repository import JobRepository
 from src.regions import REGION_DISPLAY_ORDER
+from src.version import read_app_version
 
 
 @pytest.fixture
@@ -50,6 +51,11 @@ def test_health_and_region_order(api):
     response = client.get("/api/config/regions")
     assert response.status_code == 200
     assert [item["name"] for item in response.json()["regions"]] == list(REGION_DISPLAY_ORDER)
+
+
+def test_openapi_version_matches_frontend_manifest(api):
+    client, _, _ = api
+    assert client.get("/openapi.json").json()["info"]["version"] == read_app_version()
 
 
 def test_create_job_with_all_regions_and_read_status(api):

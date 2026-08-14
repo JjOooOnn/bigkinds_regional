@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+
+repo_root=$(git -c safe.directory="$(pwd)" rev-parse --show-toplevel)
+python_executable="$repo_root/.venv/Scripts/python.exe"
+
+if [ ! -f "$python_executable" ]; then
+  printf '%s\n' "커밋 제목 검사 실패: 프로젝트 가상환경을 찾을 수 없습니다: $python_executable" >&2
+  exit 1
+fi
+
+exec "$python_executable" "$repo_root/scripts/check_commit_message.py" "$1"

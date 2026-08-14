@@ -7,6 +7,8 @@ from datetime import date
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import pytest
+
 from src.checkpoint import CheckpointStore
 from src.models import AuditRow
 from src.regional_collector import BrowserSessionFailure, RegionalCollector
@@ -168,5 +170,45 @@ def test_browser_recovery_retries_the_same_started_issue(tmp_path):
         assert collector._audit_issue.await_count == 2
         assert checkpoint.issue_status("2026-08-04", "test-region", 1) == "completed"
         assert collector.browser_restart_count == 1
+
+    asyncio.run(scenario())
+
+
+def test_exhausted_browser_recovery_keeps_started_issue_retryable(tmp_path):
+    async def scenario() -> None:
+        checkpoint = CheckpointStore(tmp_path / "checkpoint.jsonl")
+        checkpoint.mark_issue_started("2026-08-04", "test-region", 1)
+        collector = RegionalCollector(
+            start_date=date(2026, 8, 4),
+            end_date=date(2026, 8, 4),
+            regions=["test-region"],
+            headed=False,
+            max_issues=None,
+            timeout_ms=1_000,
+            retries=0,
+            link_delay_ms=0,
+            checkpoint=checkpoint,
+            logger=logging.getLogger("test_checkpoint_exhausted_recovery"),
+        )
+        page, context = AsyncMock(), AsyncMock()
+        collector._session = SimpleNamespace(
+            browser=AsyncMock(), context=context, page=page,
+        )
+        collector._select_region = AsyncMock(return_value=True)
+        collector._issue_cards = AsyncMock(return_value=[object()])
+        failure = BrowserSessionFailure(
+            "page_crashed", "Target crashed",
+            article_key=("2026-08-04", "test-region", 1, 1),
+        )
+        collector._audit_issue = AsyncMock(side_effect=failure)
+        collector._recover_browser_session = AsyncMock(return_value=False)
+
+        with pytest.raises(BrowserSessionFailure):
+            await collector._audit_region(
+                page, context, AsyncMock(), date(2026, 8, 4),
+                date(2026, 8, 4), "test-region", 0,
+            )
+
+        assert checkpoint.issue_status("2026-08-04", "test-region", 1) == "started"
 
     asyncio.run(scenario())

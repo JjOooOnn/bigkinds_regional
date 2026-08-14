@@ -1,5 +1,6 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import packageInfo from '../package.json'
 import App from './App'
 
 const regions = [
@@ -37,6 +38,18 @@ beforeEach(() => {
 })
 
 describe('점검 설정 화면', () => {
+  it('footer에 manifest 버전을 표시한다', async () => {
+    vi.spyOn(globalThis, 'fetch').mockImplementation((input) => {
+      if (String(input) === '/api/config/regions') return json({ regions })
+      if (String(input) === '/api/jobs') return json({ jobs: [] })
+      return json({})
+    })
+
+    render(<App />)
+
+    expect(await screen.findByRole('contentinfo')).toHaveTextContent(`버전 v${packageInfo.version}`)
+  })
+
   it('수동 재개가 가능한 실패 작업만 재개 대상으로 표시한다', async () => {
     const cancelled = baseJob({
       job_id: 'cancelled-job', status: 'cancelled', status_label: '중단됨',
