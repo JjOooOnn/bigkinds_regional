@@ -185,18 +185,46 @@ def is_suspicious_embedded_external_url(url: str, site_domain: str = "bigkinds.o
     return analyze_url_structure(url, site_domain).anomalous
 
 
-def result_dedup_key(requested_date: str, region: str, issue_order: int, original_url: str) -> tuple[str, str, int, str]:
-    return requested_date, region, issue_order, normalize_url(original_url)
+def result_dedup_key(
+    requested_date: str,
+    region: str,
+    issue_order: int,
+    original_url: str,
+    source_order: int = 0,
+    article_title: str = "",
+) -> tuple[str, str, int, str, int | str]:
+    """Return the stable identity of one source result.
+
+    Current rows use their source position because a retry may discover a URL
+    after the first result was written. Legacy rows without a source position
+    retain the previous URL/title fallback behavior.
+    """
+    if source_order > 0:
+        return requested_date, region, issue_order, "source_order", source_order
+    normalized_url = normalize_url(original_url)
+    fallback = normalized_url or article_title
+    return requested_date, region, issue_order, "legacy_url_or_title", fallback
+
+
+def result_identity_key(row) -> tuple[str, str, int, str, int | str]:
+    return result_dedup_key(
+        row.requested_date,
+        row.region,
+        row.issue_order,
+        getattr(row, "original_url", ""),
+        getattr(row, "source_order", 0),
+        getattr(row, "article_title", ""),
+    )
 
 
 def deduplicate_rows(rows):
-    seen = set()
     result = []
+    positions = {}
     for row in rows:
-        url = getattr(row, "original_url", "")
-        fallback = getattr(row, "article_title", "") if not url else ""
-        key = result_dedup_key(row.requested_date, row.region, row.issue_order, url) + (fallback,)
-        if key not in seen:
-            seen.add(key)
+        key = result_identity_key(row)
+        if key not in positions:
+            positions[key] = len(result)
             result.append(row)
+        else:
+            result[positions[key]] = row
     return result

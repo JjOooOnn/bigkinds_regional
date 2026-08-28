@@ -1,10 +1,28 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 
 from .models import AuditRow, DebugEntry
-from .url_utils import deduplicate_rows
+from .url_utils import deduplicate_rows, result_identity_key
+
+
+class RowUpsertStatus(str, Enum):
+    INSERTED = "inserted"
+    REPLACED = "replaced"
+    UNCHANGED = "unchanged"
+
+
+@dataclass(frozen=True)
+class RowUpsertResult:
+    status: RowUpsertStatus
+    current: AuditRow
+    previous: AuditRow | None = None
+
+    def __bool__(self) -> bool:
+        return self.status is not RowUpsertStatus.UNCHANGED
 
 
 class CheckpointStore:
@@ -90,14 +108,23 @@ class CheckpointStore:
             stream.write(json.dumps(item, ensure_ascii=False) + "\n")
             stream.flush()
 
-    def add_row(self, row: AuditRow) -> bool:
-        before = len(self.rows)
-        combined = deduplicate_rows([*self.rows, row])
-        if len(combined) == before:
-            return False
-        self.rows = combined
+    def add_row(self, row: AuditRow) -> RowUpsertResult:
+        key = result_identity_key(row)
+        previous = next(
+            (existing for existing in self.rows if result_identity_key(existing) == key),
+            None,
+        )
+        if previous == row:
+            return RowUpsertResult(RowUpsertStatus.UNCHANGED, row, previous)
+
         self._append({"type": "row", "data": row.to_dict()})
-        return True
+        self.rows = deduplicate_rows([*self.rows, row])
+        status = (
+            RowUpsertStatus.INSERTED
+            if previous is None
+            else RowUpsertStatus.REPLACED
+        )
+        return RowUpsertResult(status, row, previous)
 
     def add_debug(self, entry: DebugEntry) -> None:
         self.debug_entries.append(entry)

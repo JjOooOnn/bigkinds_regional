@@ -616,6 +616,64 @@ def test_article_deadline_returns_a_timeout_result_without_waiting_for_the_opera
     assert result.access_reason_code == "ARTICLE_DEADLINE_EXCEEDED"
 
 
+@pytest.mark.parametrize(
+    ("event", "expected_state", "inspection_page_only"),
+    [
+        ("page:crash", "page_crashed", True),
+        ("page:close", "page_closed", True),
+        ("browser:disconnected", "disconnected", False),
+    ],
+)
+def test_browser_lifecycle_failure_interrupts_article_before_deadline(
+    event, expected_state, inspection_page_only,
+):
+    collector = _collector()
+    collector.article_deadline_seconds = 10
+    collector.cleanup_timeout_seconds = 0.05
+    collector._current_article_key = ("2026-07-30", "부산광역시", 1, 2)
+    callbacks = {}
+    page = Mock()
+    page.on.side_effect = lambda name, callback: callbacks.setdefault(
+        f"page:{name}", callback,
+    )
+    browser = Mock()
+    browser.on.side_effect = lambda name, callback: callbacks.setdefault(
+        f"browser:{name}", callback,
+    )
+    collector._track_page_lifecycle(
+        page, "검사 page", inspection_page_only=True,
+    )
+    collector._track_browser_lifecycle(browser)
+    operation_cancelled = asyncio.Event()
+
+    async def scenario():
+        async def operation():
+            try:
+                await asyncio.sleep(10)
+            finally:
+                operation_cancelled.set()
+
+        controlled = asyncio.create_task(
+            collector._run_article_with_controls(operation()),
+        )
+        await asyncio.sleep(0)
+        started = time.perf_counter()
+        target = browser if event.startswith("browser:") else page
+        callbacks[event](target)
+        with pytest.raises(BrowserSessionFailure) as exc_info:
+            await asyncio.wait_for(controlled, timeout=0.5)
+        return exc_info.value, time.perf_counter() - started
+
+    failure, elapsed = asyncio.run(scenario())
+
+    assert elapsed < 0.5
+    assert operation_cancelled.is_set()
+    assert failure.state == expected_state
+    assert failure.inspection_page_only is inspection_page_only
+    assert failure.article_key == collector._current_article_key
+    assert collector._article_browser_failure_signal is None
+
+
 def test_article_check_observes_cancellation_and_acknowledges_before_cleanup():
     reporter = _RecordingReporter()
     cancellation = _MutableCancellationToken()
@@ -642,6 +700,42 @@ def test_article_check_observes_cancellation_and_acknowledges_before_cleanup():
     asyncio.run(scenario())
     assert operation_cancelled.is_set()
     assert reporter.events[0][0] == "cancel_acknowledged"
+
+
+def test_cancel_request_wins_browser_failure_race_and_cleans_up_article():
+    reporter = _RecordingReporter()
+    cancellation = _MutableCancellationToken()
+    collector = _collector(reporter=reporter, cancellation_token=cancellation)
+    collector.cleanup_timeout_seconds = 0.05
+    callbacks = {}
+    page = Mock()
+    page.on.side_effect = lambda name, callback: callbacks.setdefault(name, callback)
+    collector._track_page_lifecycle(
+        page, "검사 page", inspection_page_only=True,
+    )
+    operation_cancelled = asyncio.Event()
+
+    async def scenario():
+        async def operation():
+            try:
+                await asyncio.sleep(10)
+            finally:
+                operation_cancelled.set()
+
+        controlled = asyncio.create_task(
+            collector._run_article_with_controls(operation()),
+        )
+        await asyncio.sleep(0)
+        cancellation.requested = True
+        callbacks["crash"](page)
+        with pytest.raises(AuditCancelled):
+            await asyncio.wait_for(controlled, timeout=0.5)
+
+    asyncio.run(scenario())
+
+    assert operation_cancelled.is_set()
+    assert any(event == "cancel_acknowledged" for event, _, _ in reporter.events)
+    assert collector._article_browser_failure_signal is None
 
 
 def test_cleanup_call_is_bounded():

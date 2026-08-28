@@ -266,7 +266,7 @@ cd ..
 
 ## 버전과 커밋 제목
 
-제품 버전의 단일 기준은 `frontend/package.json`의 `version`입니다. 현재 제품 버전은 화면에는 `v1.0.1`처럼 표시되고, FastAPI OpenAPI에도 같은 값으로 노출됩니다. 버전은 Semantic Versioning을 따릅니다.
+제품 버전의 단일 기준은 `frontend/package.json`의 `version`입니다. 현재 제품 버전은 화면에는 `v1.0.2`처럼 표시되고, FastAPI OpenAPI에도 같은 값으로 노출됩니다. 버전은 Semantic Versioning을 따릅니다.
 
 - 호환성이 깨지는 변경: `major`
 - 사용자 기능 추가: `minor`

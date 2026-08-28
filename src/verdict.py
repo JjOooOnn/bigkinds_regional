@@ -8,6 +8,10 @@ STRONG_BLOCK_MARKERS = [
     "인증서 오류", "privacy error", "your connection is not private",
     "접근 제한", "접근이 제한", "접근 권한이 없", "권한이 없습니다",
 ]
+CHALLENGE_BLOCK_MARKERS = [
+    "access denied", "captcha", "robot check", "로봇이 아닙니다", "보안 차단",
+    "인증서 오류", "privacy error", "your connection is not private",
+]
 LOGIN_REQUIRED_MARKERS = ["로그인이 필요", "로그인 후 이용"]
 # 기존 외부 import와 진단 코드의 호환성을 유지한다.
 BLOCK_MARKERS = [*STRONG_BLOCK_MARKERS, *LOGIN_REQUIRED_MARKERS]
@@ -101,14 +105,18 @@ def classify_verdict_detailed(
 
     strong_marker = next((marker for marker in STRONG_BLOCK_MARKERS if marker in combined), "")
     primary_strong_marker = next((marker for marker in STRONG_BLOCK_MARKERS if marker in primary), "")
-    # 정상 기사에 딸린 댓글·구독·로그인 같은 보조 기능도 권한/CAPTCHA 문구를
-    # 표시할 수 있다. 실제 기사 렌더링 근거가 있으면 주요 콘텐츠 안에서 확인된
-    # 문구만 페이지 전체의 접근 제한 근거로 사용한다.
-    if article_rendered and primary_strong_marker:
+    primary_challenge_marker = next(
+        (marker for marker in CHALLENGE_BLOCK_MARKERS if marker in primary),
+        "",
+    )
+    # 실제 기사 제목과 충분한 본문이 렌더링된 경우, 기사 서술이나 보조 기능에
+    # 포함된 접근 권한 문구는 차단 화면 근거가 아니다. 다만 CAPTCHA·로봇 차단
+    # 같은 challenge UI 문구가 주요 콘텐츠에 있으면 기존 차단 판정을 유지한다.
+    if article_rendered and primary_challenge_marker:
         reason = "CAPTCHA 또는 접근 제한 화면 표시" if strong_marker == "captcha" else "접근 또는 인증이 제한됨"
         return VerdictDecision(
             "접근제한", "접근 제한", reason,
-            "ACCESS_STRONG_TEXT_PRIMARY", primary_strong_marker,
+            "ACCESS_STRONG_TEXT_PRIMARY", primary_challenge_marker,
         )
     # 댓글·북마크·구독 기능의 로그인 안내는 정상 기사에도 표시된다. 실제
     # 기사 제목과 충분한 본문이 렌더링된 경우에는 페이지 전체 접근 제한으로

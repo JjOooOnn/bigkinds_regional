@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import time
 from dataclasses import dataclass
@@ -24,6 +25,12 @@ SPECIFIC_ARTICLE_SELECTOR = (
     "#article-view-content-div:visible, .news_body:visible"
 )
 GENERIC_ARTICLE_SELECTOR = "article:visible"
+SPECIFIC_ARTICLE_DOM_SELECTOR = SPECIFIC_ARTICLE_SELECTOR.replace(":visible", "")
+GENERIC_ARTICLE_DOM_SELECTOR = GENERIC_ARTICLE_SELECTOR.replace(":visible", "")
+ARTICLE_EXISTS_SELECTOR = (
+    "article, [itemprop='articleBody'], .article-body, .article_body, .article-view, "
+    ".article_view, #articleBodyContents, #article-view-content-div, .news_body"
+)
 NON_NEWS_TITLE_SELECTOR = (
     "h1, h2, h3, h4, h5, h6, "
     "[class*='title' i], [id*='title' i], "
@@ -107,6 +114,41 @@ class NonNewsDetailEvidence:
     attachment_exists: bool = False
 
 
+@dataclass(frozen=True)
+class RenderedPageSnapshot:
+    document_title: str = ""
+    body_text: str = ""
+    paragraph_text_length: int = 0
+    headings: tuple[str, ...] = ()
+    render_headings: tuple[str, ...] = ()
+    visible_h1s: tuple[str, ...] = ()
+    main_texts: tuple[str, ...] = ()
+    specific_article_texts: tuple[str, ...] = ()
+    generic_article_texts: tuple[str, ...] = ()
+    article_exists: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict[str, object]) -> "RenderedPageSnapshot":
+        def text_values(key: str) -> tuple[str, ...]:
+            values = data.get(key, [])
+            if not isinstance(values, list):
+                return ()
+            return tuple(value for value in values if isinstance(value, str))
+
+        return cls(
+            document_title=str(data.get("documentTitle", "") or ""),
+            body_text=str(data.get("bodyText", "") or ""),
+            paragraph_text_length=int(data.get("paragraphTextLength", 0) or 0),
+            headings=text_values("headings"),
+            render_headings=text_values("renderHeadings"),
+            visible_h1s=text_values("visibleH1s"),
+            main_texts=text_values("mainTexts"),
+            specific_article_texts=text_values("specificArticleTexts"),
+            generic_article_texts=text_values("genericArticleTexts"),
+            article_exists=bool(data.get("articleExists", False)),
+        )
+
+
 def _normalized_title(value: str) -> str:
     return re.sub(r"[^0-9a-z가-힣]", "", (value or "").lower())
 
@@ -170,13 +212,16 @@ class BrowserLinkChecker:
     ) -> LinkCheckResult:
         timed_out = False
         last_error = ""
+        inspection_error_count = 0
         for attempt in range(self.retries + 1):
+            inspection_started = False
             try:
                 if attempt == 0:
                     await page.wait_for_load_state("domcontentloaded", timeout=self.timeout_ms)
                 else:
                     await page.reload(wait_until="domcontentloaded", timeout=self.timeout_ms)
                 await page.wait_for_timeout(1_000)
+                inspection_started = True
                 result = await self.inspect_rendered_page(
                     page, original_url, started_at, status_by_page,
                     expected_title=expected_title, status_by_url=status_by_url,
@@ -197,8 +242,23 @@ class BrowserLinkChecker:
                 last_error = f"{self.timeout_ms // 1000}초 내 응답 없음"
             except Exception as exc:
                 last_error = str(exc).splitlines()[0][:300]
+                if inspection_started:
+                    inspection_error_count += 1
             await asyncio.sleep(0.3)
         status = self._status_for(page, status_by_page, status_by_url)
+        if inspection_error_count == self.retries + 1:
+            return LinkCheckResult(
+                original_url=original_url or page.url,
+                inspection_url=original_url or page.url,
+                final_url=page.url,
+                http_status=status,
+                browser_result="확인 필요",
+                link_working_yn="N",
+                verdict="확인필요",
+                response_seconds=round(time.perf_counter() - started_at, 3),
+                error_message=last_error or "렌더링 근거 수집 중 내부 검사 오류 발생",
+                access_reason_code="INSPECTION_INTERNAL_ERROR",
+            )
         decision = classify_verdict_detailed(
             http_status=status, final_url=page.url, title="", body_text="", timed_out=timed_out,
         )
@@ -258,24 +318,25 @@ class BrowserLinkChecker:
                 return
             await page.wait_for_timeout(min(250, remaining_ms))
             try:
-                body = await page.locator("body").inner_text(timeout=min(500, remaining_ms))
-                title = await page.title()
-                headings = await page.locator(
-                    "h1:visible, h2:visible, h3:visible, h4:visible, h5:visible, h6:visible"
-                ).all_inner_texts()
-                content_texts = await page.locator(
-                    f"{SPECIFIC_ARTICLE_SELECTOR}, article:visible, main:visible, [role='main']:visible"
-                ).all_inner_texts()
+                snapshot = await self._capture_dom_snapshot(page)
             except Exception:
                 continue
 
-            body_length = len(re.sub(r"\s+", "", body or ""))
+            body_length = len(re.sub(r"\s+", "", snapshot.body_text))
+            content_texts = [
+                *snapshot.specific_article_texts,
+                *snapshot.generic_article_texts,
+                *snapshot.main_texts,
+            ]
             content_length = max(
                 [len(re.sub(r"\s+", "", text)) for text in content_texts] + [0]
             )
             if (
                 body_length >= 300
-                or article_title_matches(expected_title, [title, *headings])
+                or article_title_matches(
+                    expected_title,
+                    [snapshot.document_title, *snapshot.render_headings],
+                )
                 or content_length >= 80
             ):
                 return
@@ -287,23 +348,20 @@ class BrowserLinkChecker:
         source_type: str = "",
     ) -> LinkCheckResult:
         """추가 navigation 대기 없이 현재 Chromium 화면 자체를 판정한다."""
-        title = await page.title()
-        body = await page.locator("body").inner_text(timeout=min(self.timeout_ms, 10_000))
-        paragraphs = await page.locator("p:visible").all_inner_texts()
-        paragraph_text_length = sum(len(re.sub(r"\s+", "", text)) for text in paragraphs)
-        headings = await page.locator("h1:visible, h2:visible").all_inner_texts()
-        visible_h1s = await page.locator("h1:visible").all_inner_texts()
-        main_texts = await page.locator("main:visible, [role='main']:visible").all_inner_texts()
-        specific_article_texts = await page.locator(SPECIFIC_ARTICLE_SELECTOR).all_inner_texts()
-        generic_article_texts = await page.locator(GENERIC_ARTICLE_SELECTOR).all_inner_texts()
+        snapshot = await self._capture_dom_snapshot(page)
+        title = snapshot.document_title
+        body = snapshot.body_text
+        paragraph_text_length = snapshot.paragraph_text_length
+        headings = list(snapshot.headings)
+        visible_h1s = list(snapshot.visible_h1s)
+        main_texts = list(snapshot.main_texts)
+        specific_article_texts = list(snapshot.specific_article_texts)
+        generic_article_texts = list(snapshot.generic_article_texts)
         article_texts = [*specific_article_texts, *generic_article_texts]
         article_text_length = max(
             [len(re.sub(r"\s+", "", text)) for text in article_texts] + [0]
         )
-        article_exists = bool(await page.locator(
-            "article, [itemprop='articleBody'], .article-body, .article_body, .article-view, "
-            ".article_view, #articleBodyContents, #article-view-content-div, .news_body"
-        ).count())
+        article_exists = snapshot.article_exists
         title_matches = article_title_matches(expected_title, [title, *headings])
         article_rendered = article_rendered_evidence(
             expected_title, title, body, paragraph_text_length,
@@ -362,6 +420,68 @@ class BrowserLinkChecker:
             attachment_exists_yn="Y" if non_news_evidence.attachment_exists else "N",
             body_text_length=body_text_length,
         )
+
+    @staticmethod
+    async def _evaluate_json(
+        page: Page, expression: str, argument: object,
+    ) -> dict[str, object]:
+        serialized_argument = json.dumps(argument, ensure_ascii=False)
+        serialized = await page.evaluate(expression, serialized_argument)
+        if not isinstance(serialized, str):
+            raise TypeError("DOM inspection did not return a serialized string")
+        decoded = json.loads(serialized)
+        if not isinstance(decoded, dict):
+            raise TypeError("DOM inspection did not return a JSON object")
+        return decoded
+
+    @classmethod
+    async def _capture_dom_snapshot(cls, page: Page) -> RenderedPageSnapshot:
+        data = await cls._evaluate_json(
+            page,
+            r"""serialized => {
+                const selectors = JSON.parse(serialized);
+                const visible = element => {
+                    const style = getComputedStyle(element);
+                    const rect = element.getBoundingClientRect();
+                    return style.display !== 'none' && style.visibility !== 'hidden' &&
+                        style.opacity !== '0' && rect.width > 0 && rect.height > 0;
+                };
+                const visibleTexts = selector => {
+                    const values = [];
+                    const elements = document.querySelectorAll(selector);
+                    for (let index = 0; index < elements.length; index += 1) {
+                        const element = elements[index];
+                        if (visible(element)) values.push(element.innerText || '');
+                    }
+                    return values;
+                };
+                const compactLength = value => String(value || '').replace(/\s+/g, '').length;
+                let paragraphTextLength = 0;
+                const paragraphs = document.querySelectorAll('p');
+                for (let index = 0; index < paragraphs.length; index += 1) {
+                    const paragraph = paragraphs[index];
+                    if (visible(paragraph)) paragraphTextLength += compactLength(paragraph.innerText);
+                }
+                return JSON.stringify({
+                    documentTitle: document.title || '',
+                    bodyText: document.body ? document.body.innerText || '' : '',
+                    paragraphTextLength,
+                    headings: visibleTexts('h1, h2'),
+                    renderHeadings: visibleTexts('h1, h2, h3, h4, h5, h6'),
+                    visibleH1s: visibleTexts('h1'),
+                    mainTexts: visibleTexts("main, [role='main']"),
+                    specificArticleTexts: visibleTexts(selectors.specificArticle),
+                    genericArticleTexts: visibleTexts(selectors.genericArticle),
+                    articleExists: Boolean(document.querySelector(selectors.articleExists)),
+                });
+            }""",
+            {
+                "specificArticle": SPECIFIC_ARTICLE_DOM_SELECTOR,
+                "genericArticle": GENERIC_ARTICLE_DOM_SELECTOR,
+                "articleExists": ARTICLE_EXISTS_SELECTOR,
+            },
+        )
+        return RenderedPageSnapshot.from_dict(data)
 
     async def open_url(
         self, page: Page, url: str, started_at: float,
@@ -434,15 +554,17 @@ class BrowserLinkChecker:
             and marker_evidence.get("auxiliary_yn") == "Y"
         )
 
-    @staticmethod
+    @classmethod
     async def _inspect_non_news_detail(
-        page: Page, expected_title: str,
+        cls, page: Page, expected_title: str,
     ) -> NonNewsDetailEvidence:
         if not expected_title:
             return NonNewsDetailEvidence()
 
-        candidate_data = await page.evaluate(
-            r"""({selector, expectedLength}) => {
+        candidate_data = await cls._evaluate_json(
+            page,
+            r"""serialized => {
+                const {selector, expectedLength} = JSON.parse(serialized);
                 const visible = element => {
                     const style = getComputedStyle(element);
                     const rect = element.getBoundingClientRect();
@@ -495,12 +617,12 @@ class BrowserLinkChecker:
                         locator: path(element),
                     }];
                 });
-                return {
+                return JSON.stringify({
                     documentTitle: document.title || '',
                     ogTitle: document.querySelector('meta[property="og:title"]')?.content || '',
                     twitterTitle: document.querySelector('meta[name="twitter:title"]')?.content || '',
                     candidates,
-                };
+                });
             }""",
             {
                 "selector": NON_NEWS_TITLE_SELECTOR,
@@ -536,10 +658,12 @@ class BrowserLinkChecker:
             len(candidate.get("text", "")),
         ))
         matched = matching[0]
-        container = await page.evaluate(
-            r"""({titleLocator, titleText}) => {
+        container = await cls._evaluate_json(
+            page,
+            r"""serialized => {
+                const {titleLocator, titleText} = JSON.parse(serialized);
                 const title = document.querySelector(titleLocator);
-                if (!title) return {};
+                if (!title) return JSON.stringify({});
                 const visible = element => {
                     const style = getComputedStyle(element);
                     const rect = element.getBoundingClientRect();
@@ -620,14 +744,14 @@ class BrowserLinkChecker:
                     const content = contentText(node);
                     if (content.length > 12000) continue;
                     if (attachments.length || content.length >= 80) {
-                        return {
+                        return JSON.stringify({
                             locator: path(node),
                             contentTextLength: content.length,
                             attachmentExists: attachments.length > 0,
-                        };
+                        });
                     }
                 }
-                return {};
+                return JSON.stringify({});
             }""",
             {
                 "titleLocator": matched.get("locator", ""),
@@ -644,12 +768,14 @@ class BrowserLinkChecker:
             attachment_exists=bool(container.get("attachmentExists", False)),
         )
 
-    @staticmethod
-    async def _locate_marker(page: Page, marker: str) -> dict[str, str]:
+    @classmethod
+    async def _locate_marker(cls, page: Page, marker: str) -> dict[str, str]:
         if not marker:
             return {}
-        return await page.evaluate(
-            r"""marker => {
+        data = await cls._evaluate_json(
+            page,
+            r"""serialized => {
+                const marker = JSON.parse(serialized);
                 const needle = String(marker || '').toLowerCase();
                 const visible = element => {
                     const style = getComputedStyle(element);
@@ -714,21 +840,25 @@ class BrowserLinkChecker:
                     const element = candidates[0];
                     if (element) selected = {element, visible: false, ...context(element)};
                 }
-                if (!selected) return {};
+                if (!selected) return JSON.stringify({});
                 const visibleMatches = inspected.filter(item => item.visible);
                 const auxiliaryOnly = visibleMatches.length > 0 &&
                     visibleMatches.every(item => Boolean(item.auxiliary));
                 const {element, semantic} = selected;
-                return {
+                return JSON.stringify({
                     text: ((element.innerText || element.textContent || '').trim()).slice(0, 1000),
                     locator: path(element),
                     area: semantic ? path(semantic) : 'body',
                     visible_yn: selected.visible ? 'Y' : 'N',
                     auxiliary_yn: auxiliaryOnly ? 'Y' : 'N',
-                };
+                });
             }""",
             marker,
         )
+        return {
+            key: str(data.get(key, "") or "")
+            for key in ("text", "locator", "area", "visible_yn", "auxiliary_yn")
+        }
 
     @staticmethod
     def _status_for(

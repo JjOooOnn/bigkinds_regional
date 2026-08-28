@@ -69,6 +69,13 @@ class _Handler(BaseHTTPRequestHandler):
                 "<button><span class='text'>댓글입력 권한이 없습니다.</span></button>"
                 "</header></article></main>",
             ),
+            "/article-contextual-access": (
+                200,
+                f"<title>{ARTICLE_TITLE}</title><h1>{ARTICLE_TITLE}</h1>"
+                f"<main><article itemprop='articleBody'><p>{ARTICLE_BODY}</p>"
+                "<p>오랜 기간 항만 보안구역으로 시민들의 접근이 제한됐던 내항</p>"
+                "</article></main>",
+            ),
             "/article-ad-403": (
                 200,
                 f"<title>{ARTICLE_TITLE}</title><h1>{ARTICLE_TITLE}</h1>"
@@ -89,6 +96,24 @@ class _Handler(BaseHTTPRequestHandler):
                 "<a href=\"javascript:file_download('/download?id=1', 'report.pdf')\" "
                 "title='report.pdf 다운로드'><span>report.pdf</span></a></td></tr></tbody></table>"
                 "</section></main>",
+            ),
+            "/research-map-object": (
+                200,
+                "<script>window.Map = Object;</script>"
+                f"<title>{RESEARCH_TITLE} | 연구원</title><main><section class='report-detail'>"
+                f"<h3 class='report-title'>{RESEARCH_TITLE}</h3>"
+                "<table><tbody><tr><td>연구책임자: 홍길동</td></tr><tr><td>첨부파일: "
+                "<a href='/download/report.pdf' title='report.pdf 다운로드'>report.pdf</a>"
+                "</td></tr></tbody></table></section></main>",
+            ),
+            "/research-map-set-null": (
+                200,
+                "<script>Map.prototype.set = null;</script>"
+                f"<title>{RESEARCH_TITLE} | 연구원</title><main><section class='report-detail'>"
+                f"<h3 class='report-title'>{RESEARCH_TITLE}</h3>"
+                "<table><tbody><tr><td>연구책임자: 홍길동</td></tr><tr><td>첨부파일: "
+                "<a href='/download/report.pdf' title='report.pdf 다운로드'>report.pdf</a>"
+                "</td></tr></tbody></table></section></main>",
             ),
             "/notice-detail": (
                 200,
@@ -305,6 +330,12 @@ def test_non_news_detail_fallback_preserves_news_and_http_errors():
                 return result
 
             research = await inspect("/research-attachment", RESEARCH_TITLE, "연구보고서")
+            research_map_object = await inspect(
+                "/research-map-object", RESEARCH_TITLE, "연구보고서",
+            )
+            research_map_set_null = await inspect(
+                "/research-map-set-null", RESEARCH_TITLE, "연구보고서",
+            )
             notice = await inspect("/notice-detail", NOTICE_TITLE, "공지사항")
             notice_with_comment = await inspect(
                 "/notice-comment-permission", NOTICE_TITLE, "공지사항",
@@ -322,6 +353,18 @@ def test_non_news_detail_fallback_preserves_news_and_http_errors():
             assert research.attachment_exists_yn == "Y"
             assert research.matched_title == RESEARCH_TITLE
             assert research.content_container_locator
+
+            for damaged_map_result in (research_map_object, research_map_set_null):
+                assert (
+                    damaged_map_result.verdict,
+                    damaged_map_result.link_working_yn,
+                ) == ("정상", "Y")
+                assert damaged_map_result.access_reason_code == "NON_NEWS_DETAIL_RENDERED"
+                assert damaged_map_result.document_title == f"{RESEARCH_TITLE} | 연구원"
+                assert damaged_map_result.body_text_length > 0
+                assert damaged_map_result.matched_title == RESEARCH_TITLE
+                assert damaged_map_result.content_container_locator
+                assert damaged_map_result.attachment_exists_yn == "Y"
 
             assert (notice.verdict, notice.link_working_yn) == ("정상", "Y")
             assert notice.access_reason_code == "NON_NEWS_DETAIL_RENDERED"
@@ -349,6 +392,31 @@ def test_non_news_detail_fallback_preserves_news_and_http_errors():
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+
+
+def test_inspection_failure_is_not_reported_as_blank_page():
+    checker = BrowserLinkChecker(timeout_ms=1_000, retries=1, render_recheck_timeout_ms=0)
+    checker.inspect_rendered_page = AsyncMock(side_effect=RuntimeError("selector engine failed"))
+    page = Mock()
+    page.url = "https://example.com/report"
+    page.wait_for_load_state = AsyncMock()
+    page.reload = AsyncMock()
+    page.wait_for_timeout = AsyncMock()
+
+    result = asyncio.run(checker.inspect_open_page(
+        page,
+        page.url,
+        time.perf_counter(),
+        {page: 200},
+        expected_title=RESEARCH_TITLE,
+        source_type="연구보고서",
+    ))
+
+    assert (result.verdict, result.link_working_yn) == ("확인필요", "N")
+    assert result.browser_result == "확인 필요"
+    assert result.access_reason_code == "INSPECTION_INTERNAL_ERROR"
+    assert result.error_message == "selector engine failed"
+    assert checker.inspect_rendered_page.await_count == 2
 
 
 def test_local_browser_link_flows_and_verdicts():
@@ -447,6 +515,7 @@ def test_local_browser_link_flows_and_verdicts():
             login = await inspect("/login")
             captcha = await inspect("/captcha")
             article_with_auxiliary_permission = await inspect("/article-comment-permission")
+            article_with_contextual_access = await inspect("/article-contextual-access")
             assert not_found.verdict == "링크오류"
             assert soft_not_found.verdict == "링크오류"
             assert soft_not_found.link_working_yn == "N"
@@ -463,6 +532,10 @@ def test_local_browser_link_flows_and_verdicts():
             assert article_with_auxiliary_permission.article_exists_yn == "Y"
             assert article_with_auxiliary_permission.article_title_match_yn == "Y"
             assert article_with_auxiliary_permission.render_recheck_yn == "N"
+            assert (article_with_contextual_access.verdict, article_with_contextual_access.link_working_yn) == ("정상", "Y")
+            assert article_with_contextual_access.access_reason_code == "ARTICLE_RENDERED_AUXILIARY_ACCESS_TEXT_IGNORED"
+            assert "접근이 제한" in article_with_contextual_access.detected_phrase
+            assert "article" in article_with_contextual_access.detected_dom_area
             assert forbidden.access_reason_code == "ACCESS_HTTP_STATUS"
             assert captcha.access_reason_code == "ACCESS_STRONG_TEXT_PRIMARY"
 

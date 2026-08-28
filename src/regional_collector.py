@@ -16,7 +16,7 @@ from playwright.async_api import (
     async_playwright,
 )
 
-from .checkpoint import CheckpointStore
+from .checkpoint import CheckpointStore, RowUpsertResult, RowUpsertStatus
 from .config import ISSUE_CATEGORIES, SCREENSHOT_DIR, TARGET_URL
 from .date_navigation import DateNavigator, inclusive_dates
 from .link_checker import BrowserLinkChecker, LinkCheckResult
@@ -122,6 +122,7 @@ class RegionalCollector:
         self._intentional_page_closes: set[Page] = set()
         self._intentional_browser_closes: set[Browser] = set()
         self._current_article_key: tuple[str, str, int, int] | None = None
+        self._article_browser_failure_signal: asyncio.Future[BrowserSessionFailure] | None = None
         self._article_recovery_counts: dict[tuple[str, str, int, int], int] = {}
         self.browser_restart_count = 0
 
@@ -325,6 +326,8 @@ class RegionalCollector:
             self._disconnected_browsers.add(browser)
             if browser in self._intentional_browser_closes:
                 return
+            message = "Chromium 브라우저 연결이 예기치 않게 종료되었습니다."
+            self._signal_article_browser_failure("disconnected", message)
             self.logger.error("Chromium 브라우저 연결이 예기치 않게 종료되었습니다.")
             self.progress_reporter.emit(
                 "browser_disconnected", "Chromium 브라우저 연결이 종료되었습니다.",
@@ -334,9 +337,18 @@ class RegionalCollector:
 
         browser.on("disconnected", on_disconnected)
 
-    def _track_page_lifecycle(self, page: Page, label: str) -> None:
+    def _track_page_lifecycle(
+        self, page: Page, label: str, *, inspection_page_only: bool = False,
+    ) -> None:
         def on_crash(*_args) -> None:
             self._crashed_pages.add(page)
+            if page in self._intentional_page_closes:
+                return
+            message = f"{label}가 충돌했습니다."
+            self._signal_article_browser_failure(
+                "page_crashed", message,
+                inspection_page_only=inspection_page_only,
+            )
             self.logger.error("%s가 충돌했습니다.", label)
             self.progress_reporter.emit(
                 "page_crashed", f"{label}가 충돌했습니다.",
@@ -348,6 +360,11 @@ class RegionalCollector:
             if page in self._intentional_page_closes:
                 return
             self._unexpected_closed_pages.add(page)
+            message = f"{label}가 예기치 않게 종료되었습니다."
+            self._signal_article_browser_failure(
+                "page_closed", message,
+                inspection_page_only=inspection_page_only,
+            )
             self.logger.error("%s가 예기치 않게 종료되었습니다.", label)
             self.progress_reporter.emit(
                 "inspection_page_closed", f"{label}가 예기치 않게 종료되었습니다.",
@@ -357,6 +374,19 @@ class RegionalCollector:
 
         page.on("crash", on_crash)
         page.on("close", on_close)
+
+    def _signal_article_browser_failure(
+        self, state: str, message: str, *, inspection_page_only: bool = False,
+    ) -> None:
+        signal = self._article_browser_failure_signal
+        if signal is None or signal.done():
+            return
+        signal.set_result(BrowserSessionFailure(
+            state,
+            message,
+            inspection_page_only=inspection_page_only,
+            article_key=self._current_article_key,
+        ))
 
     def _browser_session_failure(
         self, source_page: Page, context: BrowserContext, exc: Exception,
@@ -619,7 +649,9 @@ class RegionalCollector:
             try:
                 context = await self._verification_context(environment, launch_options)
                 page = await context.new_page()
-                self._track_page_lifecycle(page, f"{environment} 검증 page")
+                self._track_page_lifecycle(
+                    page, f"{environment} 검증 page", inspection_page_only=True,
+                )
                 verifier = BrowserLinkChecker(self.timeout_ms, retries=0)
                 verified = await verifier.open_url(
                     page, url, started_at, {}, expected_title=expected_title,
@@ -1109,13 +1141,7 @@ class RegionalCollector:
                     checked_at=datetime.now().astimezone().isoformat(timespec="seconds"),
                     region_order=region_order, source_order=source_order,
                 )
-                added = self.checkpoint.add_row(row)
-                if added:
-                    self.processed_links += 1
-                    if result.verdict == "정상":
-                        self.normal_count += 1
-                    else:
-                        self.error_count += 1
+                self._upsert_audit_row(row)
                 self.checkpoint.add_debug(debug_entry(
                     "링크URL", **link_context,
                     source_href_raw=result.source_href_raw,
@@ -1234,6 +1260,44 @@ class RegionalCollector:
             mark_completed(requested.isoformat(), region, issue_index + 1)
         return True
 
+    def _upsert_audit_row(self, row: AuditRow) -> RowUpsertResult:
+        upsert = self.checkpoint.add_row(row)
+        active_rows = list(self.checkpoint.rows)
+        self.processed_links = len(active_rows)
+        self.normal_count = sum(active.verdict == "정상" for active in active_rows)
+        self.error_count = self.processed_links - self.normal_count
+
+        previous = upsert.previous
+        if (
+            upsert.status is RowUpsertStatus.REPLACED
+            and previous is not None
+            and previous.verdict != "정상"
+            and row.verdict == "정상"
+        ):
+            details = (
+                f"언론사={row.publisher}; 기사제목={row.article_title}; "
+                f"이전 판정={previous.verdict}; 최종 판정={row.verdict}; "
+                "이전 결과는 최종 결과에서 제외되었음"
+            )
+            self.checkpoint.add_debug(debug_entry(
+                "링크재시도",
+                requested_date=row.requested_date,
+                displayed_date=row.displayed_date,
+                region=row.region,
+                issue_order=row.issue_order,
+                issue_title=row.issue_title,
+                original_url=row.original_url,
+                final_url=row.final_url,
+                event="이전 판정 대체",
+                details=details,
+            ))
+            self.logger.info(
+                "[%s][%s][이슈 %d][출처 %d] 이전 판정 %s을(를) %s(으)로 대체했습니다.",
+                row.requested_date, row.region, row.issue_order, row.source_order,
+                previous.verdict, row.verdict,
+            )
+        return upsert
+
     async def _cleanup_issue_modal(self, page: Page, modal: Locator, close: Locator) -> None:
         if not await close.count() or not await close.is_visible():
             return
@@ -1249,22 +1313,36 @@ class RegionalCollector:
         await self._dismiss_header_overlay(page)
 
     async def _run_article_with_controls(self, article_check) -> LinkCheckResult:
+        browser_failure_signal = asyncio.get_running_loop().create_future()
+        self._article_browser_failure_signal = browser_failure_signal
         article_task = asyncio.create_task(article_check)
         cancel_task = asyncio.create_task(self._wait_for_cancel_request())
         try:
             done, _ = await asyncio.wait(
-                {article_task, cancel_task},
+                {article_task, cancel_task, browser_failure_signal},
                 timeout=self.article_deadline_seconds,
                 return_when=asyncio.FIRST_COMPLETED,
             )
-            if cancel_task in done:
+            if cancel_task in done or self.cancellation_token.is_cancel_requested():
                 self._acknowledge_cancellation()
                 await self._cancel_article_task(article_task)
                 raise AuditCancelled("사용자가 점검 중단을 요청했습니다.")
+            if browser_failure_signal in done:
+                failure = browser_failure_signal.result()
+                await self._cancel_article_task(article_task)
+                if self.cancellation_token.is_cancel_requested():
+                    self._acknowledge_cancellation()
+                    raise AuditCancelled("사용자가 점검 중단을 요청했습니다.")
+                raise failure
             if article_task in done:
                 return article_task.result()
 
             await self._cancel_article_task(article_task)
+            if browser_failure_signal.done():
+                raise browser_failure_signal.result()
+            if self.cancellation_token.is_cancel_requested():
+                self._acknowledge_cancellation()
+                raise AuditCancelled("사용자가 점검 중단을 요청했습니다.")
             decision = classify_verdict_detailed(
                 http_status=None,
                 final_url="",
@@ -1286,7 +1364,13 @@ class RegionalCollector:
             )
         finally:
             cancel_task.cancel()
-            await asyncio.gather(cancel_task, return_exceptions=True)
+            if not browser_failure_signal.done():
+                browser_failure_signal.cancel()
+            await asyncio.gather(
+                cancel_task, browser_failure_signal, return_exceptions=True,
+            )
+            if self._article_browser_failure_signal is browser_failure_signal:
+                self._article_browser_failure_signal = None
 
     async def _wait_for_cancel_request(self) -> None:
         while not self.cancellation_token.is_cancel_requested():
@@ -1388,7 +1472,9 @@ class RegionalCollector:
                     async with context.expect_page(timeout=popup_timeout) as page_info:
                         await click_target.click(force=True)
                     target = await page_info.value
-                    self._track_page_lifecycle(target, "검사 page")
+                    self._track_page_lifecycle(
+                        target, "검사 page", inspection_page_only=True,
+                    )
                 except PlaywrightTimeoutError:
                     await source_page.wait_for_timeout(500)
                     captured_raw = await self._take_window_open_capture(source_page, capture_key)
@@ -1625,7 +1711,9 @@ class RegionalCollector:
         started: float | None = None,
     ) -> LinkCheckResult:
         target = await context.new_page()
-        self._track_page_lifecycle(target, "URL 검사 page")
+        self._track_page_lifecycle(
+            target, "URL 검사 page", inspection_page_only=True,
+        )
         started = started if started is not None else time.perf_counter()
         try:
             result = await checker.open_url(

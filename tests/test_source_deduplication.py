@@ -18,6 +18,38 @@ def test_same_url_in_other_issue_is_retained():
     assert len(deduplicate_rows(rows)) == 2
 
 
+def test_same_source_order_uses_latest_result_even_when_url_changes():
+    timed_out = make_row(
+        source_order=1, original_url="", final_url="", verdict="타임아웃",
+        link_working_yn="N",
+    )
+    succeeded = make_row(
+        source_order=1, original_url="https://example.com/retry",
+        final_url="https://example.com/retry", verdict="정상", link_working_yn="Y",
+    )
+
+    assert deduplicate_rows([timed_out, succeeded]) == [succeeded]
+
+
+def test_same_url_at_different_source_orders_is_retained():
+    rows = [make_row(source_order=1), make_row(source_order=2)]
+    assert len(deduplicate_rows(rows)) == 2
+
+
+def test_legacy_rows_keep_url_and_title_fallback_identity():
+    same_url = [
+        make_row(source_order=0, article_title="첫 제목"),
+        make_row(source_order=0, article_title="바뀐 제목"),
+    ]
+    same_title_without_url = [
+        make_row(source_order=0, original_url="", article_title="URL 없는 기사"),
+        make_row(source_order=0, original_url="", article_title="URL 없는 기사"),
+    ]
+
+    assert len(deduplicate_rows(same_url)) == 1
+    assert len(deduplicate_rows(same_title_without_url)) == 1
+
+
 def test_parse_news_text():
     info = parse_source_text("뉴스\n데일리안 | 2026-07-01\n기사 제목")
     assert (info.source_type, info.publisher, info.article_date, info.title) == ("뉴스", "데일리안", "2026-07-01", "기사 제목")

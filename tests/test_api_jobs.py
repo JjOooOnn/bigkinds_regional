@@ -7,6 +7,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from conftest import make_row
+from src.checkpoint import CheckpointStore
 from src.api.app import create_app
 from src.application.job_manager import JobManager
 from src.application.job_repository import JobRepository
@@ -226,6 +227,35 @@ def test_results_filters_and_logs(api):
     assert body["errors"][0]["original_url"] == "https://example.com/missing"
     logs = client.get(f"/api/jobs/{job_id}/logs").json()["logs"]
     assert logs[-1]["message"] == "충청북도 점검 완료"
+
+
+def test_results_exclude_replaced_failure_from_summary_and_error_filter(api, tmp_path):
+    client, repository, _ = api
+    job = client.post("/api/jobs", json=payload()).json()
+    checkpoint = CheckpointStore(tmp_path / "retry.jsonl")
+    checkpoint.add_row(make_row(
+        source_order=1, original_url="", final_url="", http_status=None,
+        browser_result="시간 초과", link_working_yn="N", verdict="타임아웃",
+        error_message="deadline",
+    ))
+    checkpoint.add_row(make_row(
+        source_order=1, original_url="https://example.com/retry",
+        final_url="https://example.com/retry", verdict="정상", link_working_yn="Y",
+        browser_result="정상 표시", error_message="",
+    ))
+    repository.replace_results(job["job_id"], checkpoint.rows)
+
+    response = client.get(
+        f"/api/jobs/{job['job_id']}/results", params={"verdict": "타임아웃"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["summary"]["total_links"] == 1
+    assert body["summary"]["normal_count"] == 1
+    assert body["summary"]["error_count"] == 0
+    assert body["total_errors"] == 0
+    assert body["errors"] == []
 
 
 def test_excel_download_and_missing_file(api, tmp_path):

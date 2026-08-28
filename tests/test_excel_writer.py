@@ -3,6 +3,7 @@ from datetime import datetime, timedelta
 from openpyxl import load_workbook
 
 from conftest import make_row
+from src.checkpoint import CheckpointStore
 from src.config import DEBUG_COLUMNS, RESULT_COLUMNS
 from src.excel_writer import write_excel
 from src.logging_utils import debug_entry
@@ -107,4 +108,51 @@ def test_debug_sheet_separates_href_click_and_inferred_url_evidence(tmp_path):
     assert values["article존재여부_YN"] == "N"
     assert values["주요콘텐츠텍스트길이"] == 18
     assert values["기사제목일치여부_YN"] == "N"
+    workbook.close()
+
+
+def test_excel_uses_only_active_retry_result_and_keeps_debug_history(tmp_path):
+    checkpoint = CheckpointStore(tmp_path / "checkpoint.jsonl")
+    checkpoint.add_row(make_row(
+        source_order=1, original_url="", final_url="", http_status=None,
+        browser_result="시간 초과", link_working_yn="N", verdict="타임아웃",
+        error_message="deadline",
+    ))
+    checkpoint.add_debug(debug_entry("링크판정", event="타임아웃", details="최초 실패"))
+    checkpoint.add_row(make_row(
+        source_order=1, original_url="https://example.com/retry",
+        final_url="https://example.com/retry", verdict="정상", link_working_yn="Y",
+        browser_result="정상 표시", error_message="",
+    ))
+    checkpoint.add_debug(debug_entry("링크URL", event="정상 결과", final_url="https://example.com/retry"))
+    checkpoint.add_debug(debug_entry(
+        "링크재시도", event="이전 판정 대체",
+        details="이전 판정=타임아웃; 최종 판정=정상; 이전 결과는 최종 결과에서 제외되었음",
+    ))
+    started = datetime.now().astimezone()
+
+    path = write_excel(
+        tmp_path / "retry.xlsx", checkpoint.rows, checkpoint.debug_entries,
+        start_date="2026-07-01", end_date="2026-07-01",
+        started_at=started, ended_at=started + timedelta(seconds=1),
+    )
+
+    workbook = load_workbook(path, read_only=True)
+    result = workbook["점검결과"]
+    errors = workbook["오류목록"]
+    summary = workbook["점검요약"]
+    debug = workbook["디버그로그"]
+    summary_values = {
+        row[0].value: row[1].value
+        for row in summary.iter_rows(min_row=2, max_row=16)
+    }
+
+    assert result.max_row == 2
+    assert result["R2"].value == "정상"
+    assert errors.max_row == 1
+    assert summary_values["전체 링크 수"] == 1
+    assert summary_values["정상 수"] == 1
+    assert summary_values["오류 수"] == 0
+    stages = [row[1].value for row in debug.iter_rows(min_row=2)]
+    assert {"링크판정", "링크URL", "링크재시도"} <= set(stages)
     workbook.close()

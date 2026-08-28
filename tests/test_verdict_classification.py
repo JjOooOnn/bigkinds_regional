@@ -131,6 +131,21 @@ def test_auxiliary_strong_permission_message_does_not_override_rendered_article(
     assert decision.detected_marker == "권한이 없습니다"
 
 
+def test_contextual_access_text_in_rendered_article_does_not_override_normal_verdict():
+    decision = classify_verdict_detailed(
+        http_status=200,
+        final_url="https://example.com/article",
+        title="정상 기사 제목",
+        body_text=("정상 기사 본문입니다. " * 30) + "오랜 기간 항만 보안구역으로 시민들의 접근이 제한됐던 내항",
+        primary_text=("정상 기사 제목\n" + ("정상 기사 본문입니다. " * 30)
+                      + "오랜 기간 항만 보안구역으로 시민들의 접근이 제한됐던 내항"),
+        article_rendered=True,
+    )
+    assert (decision.verdict, working_yn(decision.verdict)) == ("정상", "Y")
+    assert decision.reason_code == "ARTICLE_RENDERED_AUXILIARY_ACCESS_TEXT_IGNORED"
+    assert decision.detected_marker == "접근이 제한"
+
+
 def test_login_required_page_without_article_remains_blocked():
     verdict, _, _ = classify_verdict(
         http_status=200, final_url="https://example.com/login",
