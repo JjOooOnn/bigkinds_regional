@@ -5,7 +5,7 @@
 이 프로그램은 빅카인즈 지역이슈 큐레이션 페이지에서 사용자가 지정한 날짜와 지역을 순회하며, 각 이슈에 연결된 뉴스·공지사항 링크가 실제로 정상 동작하는지 Playwright Chromium으로 점검하고 Excel 결과를 생성합니다. 명령행 인터페이스와 로컬 전용 웹 사용자 페이지가 같은 점검 서비스를 사용합니다.
 
 - 대상 페이지: [빅카인즈 지역이슈 큐레이션](https://www.bigkinds.or.kr/regional/curation.do)
-- 현재 확인한 실행 환경: Python 3.12.10
+- 현재 검증한 실행 환경: Python 3.12.13, Node.js 24.18.0
 
 프로그램의 핵심 목적은 정상 기사 URL을 추정하거나 복구하는 것이 아닙니다. 빅카인즈 출처 카드에 현재 연결된 실제 링크를 사용자가 클릭했을 때 정상적인 기사 또는 공지 화면이 표시되는지를 확인합니다. 추정 URL은 진단 정보로만 다루며 링크의 Y/N 판정에는 사용하지 않습니다.
 
@@ -74,24 +74,26 @@ HTTP 200만으로 정상 판정하지 않습니다. HTTP 상태가 200이어도 
 
 ## 설치 방법
 
-`requirements.txt`에는 Playwright, openpyxl, FastAPI, Uvicorn, httpx와 pytest가 정의되어 있습니다. 별도의 Python 최소 버전 메타데이터는 없으며, 현재 프로젝트 환경에서 확인된 Python 버전은 3.12.10입니다. Windows에서 Python 3.12를 사용하는 설치 예시는 다음과 같습니다.
+`requirements.txt`에는 직접 의존성 범위가, `requirements.lock.txt`에는 Windows와 Python 3.12에서 검증한 정확한 버전이 기록되어 있습니다. 다른 PC에서는 잠금파일을 사용하는 것을 권장합니다.
 
 ```powershell
 py -3.12 -m venv .venv
 .venv\Scripts\activate
 python -m pip install --upgrade pip
-pip install -r requirements.txt
+pip install -r requirements.lock.txt
 python -m playwright install chromium
 ```
 
-웹 사용자 페이지를 사용하려면 Node.js와 npm도 필요합니다. 프런트엔드는 CDN을 사용하지 않으며 `frontend/package-lock.json`에 기록된 패키지를 로컬에 설치합니다.
+웹 사용자 페이지를 사용하려면 Node.js `^20.19.0` 또는 `22.12.0` 이상도 필요합니다. 프런트엔드는 CDN을 사용하지 않으며 `frontend/package-lock.json`에 기록된 패키지를 그대로 설치합니다.
 
 ```powershell
 cd frontend
-npm install
+npm ci
 npm run build
 cd ..
 ```
+
+다른 PC 설치와 제출 파일 구성은 [설치·제출 안내](docs/setup-and-submission.md)를 참고하세요.
 
 ## 로컬 웹 사용자 페이지
 
@@ -266,7 +268,7 @@ cd ..
 
 ## 버전과 커밋 제목
 
-제품 버전의 단일 기준은 `frontend/package.json`의 `version`입니다. 현재 제품 버전은 화면에는 `v1.0.2`처럼 표시되고, FastAPI OpenAPI에도 같은 값으로 노출됩니다. 버전은 Semantic Versioning을 따릅니다.
+제품 버전의 단일 기준은 `frontend/package.json`의 `version`입니다. 현재 제품 버전은 화면에는 `v1.0.3`으로 표시되고, FastAPI OpenAPI에도 같은 값으로 노출됩니다. 버전은 Semantic Versioning을 따릅니다.
 
 - 호환성이 깨지는 변경: `major`
 - 사용자 기능 추가: `minor`
@@ -317,12 +319,15 @@ src/checkpoint.py               기존 JSONL 체크포인트
 src/excel_writer.py             기존 4개 시트 Excel 생성
 frontend/                       React·TypeScript·Vite 소스
 tests/                          기존 회귀 및 API·작업 관리자 테스트
+scripts/package_source.ps1      제출용 소스 ZIP 생성
+requirements.lock.txt           검증된 Python 의존성 잠금파일
+docs/                           설치·제출 안내와 과거 개발 기록
 ```
 
 ## 문제 해결
 
 - 브라우저가 자동으로 열리지 않으면 직접 `http://127.0.0.1:8000`에 접속합니다.
-- 첫 화면에 프런트엔드 빌드가 없다는 안내가 나오면 `frontend`에서 `npm install`과 `npm run build`를 실행합니다.
+- 첫 화면에 프런트엔드 빌드가 없다는 안내가 나오면 `frontend`에서 `npm ci`와 `npm run build`를 실행합니다.
 - API 서버 연결 안내가 나오면 `run_web.py`를 실행한 콘솔이 종료되지 않았는지 확인합니다.
 - Chromium 실행 파일 오류가 나오면 `python -m playwright install chromium`을 다시 실행합니다.
 - 이미 실행 중인 작업 안내가 나오면 상단의 `진행 중인 점검`에서 기존 작업을 확인하거나 중단합니다.

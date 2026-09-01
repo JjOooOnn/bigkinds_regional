@@ -158,7 +158,7 @@ API를 통해 기사 연산 중인 작업에 취소를 요청했다. `cancel_req
 7. 사용자 취소 작업은 어떤 경우에도 자동 재개하지 않는다.
 8. 체크포인트에 이슈 `started`·`completed`·`failed`를 구분한 뒤 브라우저 복구를 활성화한다.
 
-세부 단계와 대상 파일은 `docs/implementation-plan.md`의 3~8단계에 반영한다.
+세부 단계와 대상 파일은 `docs/archive/implementation-plan.md`의 3~8단계에 반영한다.
 
 ## 검증 기록
 

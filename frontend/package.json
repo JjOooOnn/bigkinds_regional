@@ -1,8 +1,11 @@
 {
   "name": "bigkinds-regional-web",
   "private": true,
-  "version": "1.0.2",
+  "version": "1.0.3",
   "type": "module",
+  "engines": {
+    "node": "^20.19.0 || >=22.12.0"
+  },
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "build": "tsc -b && vite build",

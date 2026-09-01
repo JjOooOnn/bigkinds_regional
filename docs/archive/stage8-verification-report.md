@@ -1,7 +1,7 @@
 # 8단계 전체 검증 기록
 
 - 검증일: 2026-08-04
-- 기준 문서: `docs/implementation-plan.md` 8단계
+- 기준 문서: `docs/archive/implementation-plan.md` 8단계
 - 상태: 자동화 검증 완료, 실제 사이트의 기사 행 생성 및 전체 17지역 장시간 검증은 보류
 
 ## 자동화 검증

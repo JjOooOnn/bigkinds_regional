@@ -2,8 +2,8 @@
 
 - 검토일: 2026-08-04
 - 검토 대상: 현재 작업 트리의 추적 파일 변경과 관련 미추적 파일
-- 검토 기준: 최초 요구사항, `AGENTS.md`, `docs/implementation-plan.md`, 실제 변경 코드, 테스트 결과
-- 검토 전제: 저장소에서 별도의 최초 요구사항 원문을 찾지 못해 `docs/implementation-plan.md`의 목표와 1단계를 기준으로 판단했다.
+- 검토 기준: 최초 요구사항, `AGENTS.md`, `docs/archive/implementation-plan.md`, 실제 변경 코드, 테스트 결과
+- 검토 전제: 저장소에서 별도의 최초 요구사항 원문을 찾지 못해 `docs/archive/implementation-plan.md`의 목표와 1단계를 기준으로 판단했다.
 - 결론: 수정이 필요한 문제가 발견되어 커밋하지 않았다.
 
 ## Critical

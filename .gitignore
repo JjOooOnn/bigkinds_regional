@@ -1,4 +1,4 @@
-# Python
+# Python caches and build output
 __pycache__/
 *.py[cod]
 *.pyo
@@ -13,14 +13,15 @@ build/
 dist/
 *.egg-info/
 
-# Virtual environment
-.venv/
-venv/
-env/
+# Local Python environments
+/.venv/
+/venv/
+/env/
 
-# PyCharm / IDE
-.idea/
-.ai/
+# IDE and local agent metadata
+/.idea/
+/.ai/
+/.playwright-mcp/
 *.iml
 
 # Environment and secrets
@@ -30,57 +31,35 @@ env/
 *.pem
 *.key
 
-# Generated results (keep an optional directory placeholder)
-output/*
-!output/.gitkeep
-result/*
-!result/.gitkeep
-results/*
-!results/.gitkeep
-
-# Runtime work and checkpoints
-work/*
-!work/.gitkeep
-checkpoints/*
-!checkpoints/.gitkeep
-
-# Logs
-logs/*
-!logs/.gitkeep
+# Runtime data and generated reports
+/output/
+/work/
+/artifacts/
+/result/
+/results/
+/checkpoints/
+/logs/
 *.log
-
-# Playwright artifacts
-.playwright-mcp/
-artifacts/screenshots/*
-!artifacts/screenshots/.gitkeep
-artifacts/traces/*
-!artifacts/traces/.gitkeep
-test-results/
-playwright-report/
-blob-report/
-
-# Frontend dependencies and build output
-frontend/node_modules/
-frontend/dist/
-frontend/*.tsbuildinfo
-frontend/coverage/
-frontend/vite.config.js
-frontend/vite.config.d.ts
-
-# Local web application state
-/work/web_jobs.sqlite3
-/work/web_jobs.sqlite3-shm
-/work/web_jobs.sqlite3-wal
-
-# Generated Excel/CSV files
 *.xlsx
 *.xls
 /bigkinds_regional_link_audit*.csv
-/bigkinds_regional.zip
-/ICON-N-B(ico).ico
 
-# Manually generated diagnostic screenshots
+# Submission and browser-test artifacts
+/release/
+/*.zip
+/ICON-N-B(ico).ico
 /ggilbo_*_mcp_*.png
+/test-results/
+/playwright-report/
+/blob-report/
+
+# Frontend dependencies and build output
+/frontend/node_modules/
+/frontend/dist/
+/frontend/*.tsbuildinfo
+/frontend/coverage/
+/frontend/vite.config.js
+/frontend/vite.config.d.ts
 
 # OS
 .DS_Store
