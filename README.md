@@ -74,6 +74,14 @@ HTTP 200만으로 정상 판정하지 않습니다. HTTP 상태가 200이어도 
 
 ## 설치 방법
 
+### 일반 사용자: 압축 해제 후 실행
+
+Windows 10/11 64비트 사용자는 제작자가 제공하는 **`bigkinds_regional-v1.1.0-windows-x64.zip`** 전체를 쓰기 가능한 폴더에 풀고 **`실행.bat`을 더블클릭**합니다. Python·Node.js 설치나 명령어 입력 없이 기존 웹 화면을 사용할 수 있습니다. 실행 창은 열어 두고, 종료 시 `Ctrl+C`를 누릅니다.
+
+이 사용자용 ZIP에는 실행 환경과 Chromium이 포함되며 최초 실행 시 추가 다운로드를 하지 않습니다. 실제 링크 점검에는 인터넷이 필요합니다. 개발자용 `source.zip`과는 다릅니다. ZIP 제작, 문제 해결, 기록을 보존하는 업데이트 절차는 [설치·제출 안내](docs/setup-and-submission.md)를 참고하세요.
+
+### 개발자용 소스 설치
+
 `requirements.txt`에는 직접 의존성 범위가, `requirements.lock.txt`에는 Windows와 Python 3.12에서 검증한 정확한 버전이 기록되어 있습니다. 다른 PC에서는 잠금파일을 사용하는 것을 권장합니다.
 
 ```powershell
@@ -270,7 +278,7 @@ cd ..
 
 ## 버전과 커밋 제목
 
-제품 버전의 단일 기준은 `frontend/package.json`의 `version`입니다. 현재 제품 버전은 화면에는 `v1.0.3`으로 표시되고, FastAPI OpenAPI에도 같은 값으로 노출됩니다. 버전은 Semantic Versioning을 따릅니다.
+제품 버전의 단일 기준은 `frontend/package.json`의 `version`입니다. 현재 제품 버전은 화면에는 `v1.1.0`으로 표시되고, FastAPI OpenAPI에도 같은 값으로 노출됩니다. 버전은 Semantic Versioning을 따릅니다.
 
 - 호환성이 깨지는 변경: `major`
 - 사용자 기능 추가: `minor`
@@ -322,6 +330,9 @@ src/excel_writer.py             기존 4개 시트 Excel 생성
 frontend/                       React·TypeScript·Vite 소스
 tests/                          기존 회귀 및 API·작업 관리자 테스트
 scripts/package_source.ps1      제출용 소스 ZIP 생성
+scripts/package_portable.ps1    Windows 사용자용 실행 ZIP 생성·검증
+scripts/portable_launcher.py    배포 전용 사전 확인·서버 실행
+scripts/portable_smoke.py       번들 런타임·Chromium·서버 검증
 requirements.lock.txt           검증된 Python 의존성 잠금파일
 docs/                           설치·제출 안내와 과거 개발 기록
 ```
