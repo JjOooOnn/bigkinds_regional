@@ -66,7 +66,6 @@ def test_local_runtime_exposes_headed_capability(api):
 def server_api(monkeypatch, tmp_path):
     monkeypatch.setenv("BIGKINDS_RUNTIME", "server")
     monkeypatch.setenv("ALLOWED_HOSTS", "audit.example,healthcheck.railway.app")
-    monkeypatch.setenv("BIGKINDS_ACCESS_PASSWORD", "shared-test-password")
     repository = JobRepository(tmp_path / "jobs.sqlite3")
     launched: list[str] = []
     manager = JobManager(repository, worker_launcher=launched.append, recover_on_start=False)
@@ -79,7 +78,7 @@ def server_api(monkeypatch, tmp_path):
         yield client, repository, launched
 
 
-def test_server_mode_requires_hosts_and_password_before_creating_database(monkeypatch, tmp_path):
+def test_server_mode_requires_hosts_but_not_a_password(monkeypatch, tmp_path):
     monkeypatch.setenv("BIGKINDS_RUNTIME", "server")
     monkeypatch.delenv("ALLOWED_HOSTS", raising=False)
     monkeypatch.delenv("BIGKINDS_ACCESS_PASSWORD", raising=False)
@@ -90,83 +89,79 @@ def test_server_mode_requires_hosts_and_password_before_creating_database(monkey
     assert not db_path.exists()
 
     monkeypatch.setenv("ALLOWED_HOSTS", "audit.example")
-    with pytest.raises(ValueError, match="BIGKINDS_ACCESS_PASSWORD"):
-        create_app(db_path=db_path)
-    assert not db_path.exists()
+    app = create_app(db_path=db_path)
+    assert db_path.exists()
+    with TestClient(app, base_url="https://audit.example") as client:
+        assert client.get("/api/health").status_code == 200
 
 
 @pytest.mark.parametrize("hosts", ["*", "*.example.com", "https://audit.example", "audit.example:443"])
 def test_server_mode_rejects_non_exact_hosts(monkeypatch, tmp_path, hosts):
     monkeypatch.setenv("BIGKINDS_RUNTIME", "server")
     monkeypatch.setenv("ALLOWED_HOSTS", hosts)
-    monkeypatch.setenv("BIGKINDS_ACCESS_PASSWORD", "shared-test-password")
+    monkeypatch.delenv("BIGKINDS_ACCESS_PASSWORD", raising=False)
     with pytest.raises(ValueError, match="ALLOWED_HOSTS"):
         create_app(db_path=tmp_path / "jobs.sqlite3")
 
 
-def test_server_health_is_public_and_runtime_and_files_are_protected(server_api, tmp_path):
+def test_server_ui_api_docs_assets_and_download_are_public(server_api, tmp_path):
     client, repository, launched = server_api
-    auth = ("bigkinds", "shared-test-password")
-
     assert client.get("/api/health").json() == {
         "status": "ok", "local_only": False, "active_job_id": None,
     }
-    assert client.post("/api/health").status_code == 401
-    assert client.head("/api/health").status_code == 401
-    for path in ("/", "/assets/app.js", "/openapi.json", "/api/config/runtime", "/api/jobs"):
+    assert client.post("/api/health").status_code != 401
+    assert client.head("/api/health").status_code != 401
+    for path in (
+        "/", "/assets/app.js", "/docs", "/redoc", "/openapi.json",
+        "/api/config/runtime", "/api/jobs",
+    ):
         response = client.get(path)
-        assert response.status_code == 401
-        assert response.headers["www-authenticate"].startswith("Basic ")
-    assert client.get("/api/jobs", auth=("bigkinds", "wrong")).status_code == 401
-    assert client.post("/api/jobs", json=payload()).status_code == 401
-    assert client.get("/api/config/runtime", auth=auth).json() == {
+        assert response.status_code == 200
+        assert "www-authenticate" not in response.headers
+    assert client.get("/api/config/runtime").json() == {
         "runtime": "server", "user_headed_allowed": False,
     }
-    assert client.get("/", auth=auth).status_code == 200
-    assert client.get("/assets/app.js", auth=auth).status_code == 200
-    assert client.get("/openapi.json", auth=auth).status_code == 200
 
-    created = client.post("/api/jobs", json=payload(), auth=auth)
+    created = client.post("/api/jobs", json=payload())
     assert created.status_code == 201
     job_id = created.json()["job_id"]
     assert launched == [job_id]
     assert client.get("/api/health").json()["active_job_id"] is None
-    assert client.post(f"/api/jobs/{job_id}/cancel").status_code == 401
+    assert client.post(f"/api/jobs/{job_id}/cancel").status_code != 401
     report = tmp_path / "report.xlsx"
     report.write_bytes(b"workbook")
     repository.update_job(job_id, excel_path=str(report), status="completed")
-    assert client.get(f"/api/jobs/{job_id}/download").status_code == 401
-    assert client.get(f"/api/jobs/{job_id}/download", auth=auth).content == b"workbook"
+    download = client.get(f"/api/jobs/{job_id}/download")
+    assert download.status_code == 200
+    assert download.content == b"workbook"
+    assert "www-authenticate" not in download.headers
     assert client.get("/api/health").json()["active_job_id"] is None
 
 
 def test_server_mode_rejects_headed_before_spawning_worker(server_api):
     client, _, launched = server_api
-    response = client.post(
-        "/api/jobs", json=payload(headed=True), auth=("bigkinds", "shared-test-password"),
-    )
+    response = client.post("/api/jobs", json=payload(headed=True))
     assert response.status_code == 422
     assert launched == []
-    assert client.get("/api/jobs", auth=("bigkinds", "shared-test-password")).json()["jobs"] == []
+    assert client.get("/api/jobs").json()["jobs"] == []
 
 
 def test_server_mode_rejects_cross_origin_changes_and_unknown_hosts(server_api):
     client, _, launched = server_api
-    auth = ("bigkinds", "shared-test-password")
     cross_origin = client.post(
-        "/api/jobs", json=payload(), auth=auth,
+        "/api/jobs", json=payload(),
         headers={"Origin": "https://other.example"},
     )
     assert cross_origin.status_code == 403
     cross_site = client.post(
-        "/api/jobs", json=payload(), auth=auth,
+        "/api/jobs", json=payload(),
         headers={"Sec-Fetch-Site": "cross-site"},
     )
     assert cross_site.status_code == 403
     assert launched == []
     assert client.get("/api/health", headers={"Host": "other.example"}).status_code == 400
     same_origin = client.post(
-        "/api/jobs", json=payload(), auth=auth,
+        "/api/jobs", json=payload(),
         headers={"Origin": "https://audit.example", "Sec-Fetch-Site": "same-origin"},
     )
     assert same_origin.status_code == 201

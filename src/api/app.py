@@ -17,8 +17,8 @@ from src.config import ROOT_DIR, WORK_DIR, load_runtime_config
 from src.logging_utils import log_lifecycle_event, sanitize
 from src.version import read_app_version
 
-from .access_control import ServerAccessMiddleware, load_server_access_settings
 from .routes_jobs import router
+from .server_middleware import ServerRequestOriginMiddleware, load_allowed_hosts
 
 
 WEB_DB_PATH = WORK_DIR / "web_jobs.sqlite3"
@@ -32,7 +32,7 @@ def create_app(
     frontend_dist: Path = FRONTEND_DIST,
 ) -> FastAPI:
     runtime = load_runtime_config()
-    access = load_server_access_settings() if runtime.is_server else None
+    allowed_hosts = load_allowed_hosts() if runtime.is_server else None
     owns_manager = job_manager is None
     repository = job_manager.repository if job_manager else JobRepository(db_path)
     manager = job_manager or JobManager(repository, recover_on_start=False)
@@ -75,9 +75,9 @@ def create_app(
     app.state.job_repository = repository
     app.state.job_manager = manager
     app.state.runtime_config = runtime
-    if access is not None:
-        app.add_middleware(ServerAccessMiddleware, password=access.password)
-        app.add_middleware(TrustedHostMiddleware, allowed_hosts=list(access.allowed_hosts))
+    if allowed_hosts is not None:
+        app.add_middleware(ServerRequestOriginMiddleware)
+        app.add_middleware(TrustedHostMiddleware, allowed_hosts=list(allowed_hosts))
     else:
         app.add_middleware(
             TrustedHostMiddleware,
