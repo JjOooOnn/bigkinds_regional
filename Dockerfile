@@ -32,7 +32,7 @@ COPY frontend/package.json ./frontend/package.json
 COPY --from=frontend-build /build/frontend/dist/ ./frontend/dist/
 
 RUN mkdir -p /data
-RUN python scripts/playwright_runtime_smoke.py
+RUN PYTHONPATH=/app python scripts/playwright_runtime_smoke.py
 EXPOSE 8000
 
 # tini reaps browser descendants; the Python launcher owns Xvfb and worker shutdown.
