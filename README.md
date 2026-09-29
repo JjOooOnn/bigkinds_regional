@@ -2,7 +2,7 @@
 
 ## 프로젝트 소개
 
-이 프로그램은 빅카인즈 지역이슈 큐레이션 페이지에서 사용자가 지정한 날짜와 지역을 순회하며, 각 이슈에 연결된 뉴스·공지사항 링크가 실제로 정상 동작하는지 Playwright Chromium으로 점검하고 Excel 결과를 생성합니다. 명령행 인터페이스와 로컬 전용 웹 사용자 페이지가 같은 점검 서비스를 사용합니다.
+이 프로그램은 빅카인즈 지역이슈 큐레이션 페이지에서 사용자가 지정한 날짜와 지역을 순회하며, 각 이슈에 연결된 뉴스·공지사항 링크가 실제로 정상 동작하는지 Playwright Chromium으로 점검하고 Excel 결과를 생성합니다. 명령행 인터페이스와 웹 사용자 페이지가 같은 점검 서비스를 사용합니다.
 
 - 대상 페이지: [빅카인즈 지역이슈 큐레이션](https://www.bigkinds.or.kr/regional/curation.do)
 - 현재 검증한 실행 환경: Python 3.12.13, Node.js 24.18.0
@@ -96,6 +96,8 @@ cd ..
 다른 PC 설치와 제출 파일 구성은 [설치·제출 안내](docs/setup-and-submission.md)를 참고하세요.
 
 ## 로컬 웹 사용자 페이지
+
+Railway에서 같은 웹 서비스를 실행할 때 필요한 설정은 [Railway 배포 설정](docs/railway-deployment.md)을 참고하세요.
 
 ### 화면별 기능
 
@@ -307,7 +309,7 @@ python main.py --start-date 2026-07-08 --end-date 2026-07-08 --regions 충청북
 
 ```text
 main.py                         CLI 입력 처리
-run_web.py                      loopback 전용 단일 웹 서버 실행
+run_web.py                      로컬 loopback 또는 서버 모드의 단일 웹 서버 실행
 src/application/audit_service.py  CLI·웹 공통 실행 서비스
 src/application/job_manager.py    worker process와 중단 요청 관리
 src/application/job_repository.py SQLite 작업·로그·결과 저장
