@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from datetime import date
 
 import pytest
@@ -29,6 +30,49 @@ def test_web_runner_binds_only_to_loopback_and_preserves_daily_log(monkeypatch, 
     assert '"termination_reason": "uvicorn_returned"' in text
     assert "test-secret" not in text
     assert "[마스킹]" in text
+
+
+def test_server_mode_uses_railway_settings_without_opening_browser_or_building(
+    monkeypatch, tmp_path,
+):
+    called = {}
+
+    def fake_run(app, **kwargs):
+        called.update({"app": app, **kwargs})
+
+    monkeypatch.setenv("BIGKINDS_RUNTIME", "server")
+    monkeypatch.setattr(run_web, "managed_display", lambda runtime: nullcontext())
+    monkeypatch.setenv("PORT", "9123")
+    monkeypatch.setenv("BIGKINDS_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(run_web.uvicorn, "run", fake_run)
+    monkeypatch.setattr(run_web, "FRONTEND_INDEX", tmp_path / "index.html")
+    (tmp_path / "index.html").write_text("built", encoding="utf-8")
+    monkeypatch.setattr(run_web, "SERVER_LOG_DIR", tmp_path / "logs")
+    monkeypatch.setattr(
+        run_web, "ensure_frontend_build",
+        lambda: pytest.fail("서버 모드는 프런트엔드를 빌드하지 않아야 합니다."),
+    )
+    monkeypatch.setattr(
+        run_web.webbrowser, "open",
+        lambda _url: pytest.fail("서버 모드는 브라우저를 열지 않아야 합니다."),
+    )
+
+    assert run_web.main([]) == 0
+
+    assert called == {
+        "app": "src.api.app:app",
+        "host": "0.0.0.0",
+        "port": 9123,
+        "workers": 1,
+    }
+
+
+def test_server_mode_fails_when_frontend_build_is_missing(monkeypatch, tmp_path):
+    monkeypatch.setenv("BIGKINDS_RUNTIME", "server")
+    monkeypatch.setattr(run_web, "FRONTEND_INDEX", tmp_path / "missing" / "index.html")
+
+    with pytest.raises(RuntimeError, match="frontend/dist"):
+        run_web.main([])
 
 
 def test_server_output_log_rotates_when_date_changes(tmp_path):

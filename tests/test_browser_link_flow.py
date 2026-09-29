@@ -631,7 +631,12 @@ def test_local_browser_link_flows_and_verdicts():
         thread.join(timeout=2)
 
 
-def test_headless_main_403_can_be_reclassified_after_article_dom_verification():
+def test_headless_main_403_can_be_reclassified_after_article_dom_verification(monkeypatch):
+    # The verification context below is injected; no actual display is needed.
+    monkeypatch.setattr(
+        "src.regional_collector.verification_environments",
+        lambda _: (("번들 Chromium headed", {"headless": False}),),
+    )
     server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
     thread = Thread(target=server.serve_forever, daemon=True)
     thread.start()

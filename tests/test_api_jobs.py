@@ -54,6 +54,124 @@ def test_health_and_region_order(api):
     assert [item["name"] for item in response.json()["regions"]] == list(REGION_DISPLAY_ORDER)
 
 
+def test_local_runtime_exposes_headed_capability(api):
+    client, _, _ = api
+    assert client.get("/api/config/runtime").json() == {
+        "runtime": "local", "user_headed_allowed": True,
+    }
+    assert client.post("/api/jobs", json=payload(headed=True)).status_code == 201
+
+
+@pytest.fixture
+def server_api(monkeypatch, tmp_path):
+    monkeypatch.setenv("BIGKINDS_RUNTIME", "server")
+    monkeypatch.setenv("ALLOWED_HOSTS", "audit.example,healthcheck.railway.app")
+    monkeypatch.setenv("BIGKINDS_ACCESS_PASSWORD", "shared-test-password")
+    repository = JobRepository(tmp_path / "jobs.sqlite3")
+    launched: list[str] = []
+    manager = JobManager(repository, worker_launcher=launched.append, recover_on_start=False)
+    frontend = tmp_path / "frontend"
+    (frontend / "assets").mkdir(parents=True)
+    (frontend / "index.html").write_text("<h1>audit</h1>", encoding="utf-8")
+    (frontend / "assets" / "app.js").write_text("console.log('audit')", encoding="utf-8")
+    app = create_app(job_manager=manager, frontend_dist=frontend)
+    with TestClient(app, base_url="https://audit.example") as client:
+        yield client, repository, launched
+
+
+def test_server_mode_requires_hosts_and_password_before_creating_database(monkeypatch, tmp_path):
+    monkeypatch.setenv("BIGKINDS_RUNTIME", "server")
+    monkeypatch.delenv("ALLOWED_HOSTS", raising=False)
+    monkeypatch.delenv("BIGKINDS_ACCESS_PASSWORD", raising=False)
+    db_path = tmp_path / "jobs.sqlite3"
+
+    with pytest.raises(ValueError, match="ALLOWED_HOSTS"):
+        create_app(db_path=db_path)
+    assert not db_path.exists()
+
+    monkeypatch.setenv("ALLOWED_HOSTS", "audit.example")
+    with pytest.raises(ValueError, match="BIGKINDS_ACCESS_PASSWORD"):
+        create_app(db_path=db_path)
+    assert not db_path.exists()
+
+
+@pytest.mark.parametrize("hosts", ["*", "*.example.com", "https://audit.example", "audit.example:443"])
+def test_server_mode_rejects_non_exact_hosts(monkeypatch, tmp_path, hosts):
+    monkeypatch.setenv("BIGKINDS_RUNTIME", "server")
+    monkeypatch.setenv("ALLOWED_HOSTS", hosts)
+    monkeypatch.setenv("BIGKINDS_ACCESS_PASSWORD", "shared-test-password")
+    with pytest.raises(ValueError, match="ALLOWED_HOSTS"):
+        create_app(db_path=tmp_path / "jobs.sqlite3")
+
+
+def test_server_health_is_public_and_runtime_and_files_are_protected(server_api, tmp_path):
+    client, repository, launched = server_api
+    auth = ("bigkinds", "shared-test-password")
+
+    assert client.get("/api/health").json() == {
+        "status": "ok", "local_only": False, "active_job_id": None,
+    }
+    assert client.post("/api/health").status_code == 401
+    assert client.head("/api/health").status_code == 401
+    for path in ("/", "/assets/app.js", "/openapi.json", "/api/config/runtime", "/api/jobs"):
+        response = client.get(path)
+        assert response.status_code == 401
+        assert response.headers["www-authenticate"].startswith("Basic ")
+    assert client.get("/api/jobs", auth=("bigkinds", "wrong")).status_code == 401
+    assert client.post("/api/jobs", json=payload()).status_code == 401
+    assert client.get("/api/config/runtime", auth=auth).json() == {
+        "runtime": "server", "user_headed_allowed": False,
+    }
+    assert client.get("/", auth=auth).status_code == 200
+    assert client.get("/assets/app.js", auth=auth).status_code == 200
+    assert client.get("/openapi.json", auth=auth).status_code == 200
+
+    created = client.post("/api/jobs", json=payload(), auth=auth)
+    assert created.status_code == 201
+    job_id = created.json()["job_id"]
+    assert launched == [job_id]
+    assert client.get("/api/health").json()["active_job_id"] is None
+    assert client.post(f"/api/jobs/{job_id}/cancel").status_code == 401
+    report = tmp_path / "report.xlsx"
+    report.write_bytes(b"workbook")
+    repository.update_job(job_id, excel_path=str(report), status="completed")
+    assert client.get(f"/api/jobs/{job_id}/download").status_code == 401
+    assert client.get(f"/api/jobs/{job_id}/download", auth=auth).content == b"workbook"
+    assert client.get("/api/health").json()["active_job_id"] is None
+
+
+def test_server_mode_rejects_headed_before_spawning_worker(server_api):
+    client, _, launched = server_api
+    response = client.post(
+        "/api/jobs", json=payload(headed=True), auth=("bigkinds", "shared-test-password"),
+    )
+    assert response.status_code == 422
+    assert launched == []
+    assert client.get("/api/jobs", auth=("bigkinds", "shared-test-password")).json()["jobs"] == []
+
+
+def test_server_mode_rejects_cross_origin_changes_and_unknown_hosts(server_api):
+    client, _, launched = server_api
+    auth = ("bigkinds", "shared-test-password")
+    cross_origin = client.post(
+        "/api/jobs", json=payload(), auth=auth,
+        headers={"Origin": "https://other.example"},
+    )
+    assert cross_origin.status_code == 403
+    cross_site = client.post(
+        "/api/jobs", json=payload(), auth=auth,
+        headers={"Sec-Fetch-Site": "cross-site"},
+    )
+    assert cross_site.status_code == 403
+    assert launched == []
+    assert client.get("/api/health", headers={"Host": "other.example"}).status_code == 400
+    same_origin = client.post(
+        "/api/jobs", json=payload(), auth=auth,
+        headers={"Origin": "https://audit.example", "Sec-Fetch-Site": "same-origin"},
+    )
+    assert same_origin.status_code == 201
+
+
 def test_openapi_version_matches_frontend_manifest(api):
     client, _, _ = api
     assert client.get("/openapi.json").json()["info"]["version"] == read_app_version()

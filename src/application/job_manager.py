@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import multiprocessing
 import os
+import sys
 import threading
 from pathlib import Path
 from typing import Any, Callable
 from uuid import uuid4
 
-from src.config import OUTPUT_DIR, WORK_DIR
+from src.config import OUTPUT_DIR, WORK_DIR, load_runtime_config
 from src.logging_utils import sanitize
 from src.regions import resume_checkpoint_path
 
@@ -21,6 +22,10 @@ from .job_repository import (
     now_iso,
 )
 from .progress import CancellationToken, ProgressReporter
+from .worker_processes import (
+    WorkerOwnership, enter_worker_session, register_worker,
+    require_process_tracking, terminate_owned_processes,
+)
 
 
 class SqliteProgressReporter(ProgressReporter):
@@ -155,6 +160,11 @@ def run_audit_job_worker(db_path: str, job_id: str) -> None:
         heartbeat.join(timeout=1)
 
 
+def run_isolated_audit_job_worker(db_path: str, job_id: str, token: str, connection) -> None:
+    if enter_worker_session(token, connection):
+        run_audit_job_worker(db_path, job_id)
+
+
 class JobManager:
     def __init__(
         self,
@@ -167,6 +177,11 @@ class JobManager:
     ):
         self.repository = repository
         self._processes: dict[str, multiprocessing.Process] = {}
+        self._isolate_workers = load_runtime_config().is_server and sys.platform.startswith("linux")
+        self._owners: dict[str, WorkerOwnership] = {}
+        self._cleanup_lock = threading.Lock()
+        self._admission_lock = threading.RLock()
+        self._stopping = False
         self._worker_launcher = worker_launcher
         self.cancel_grace_seconds = cancel_grace_seconds
         self.terminate_grace_seconds = terminate_grace_seconds
@@ -176,6 +191,14 @@ class JobManager:
             self.repository.recover_interrupted_jobs()
 
     def create_job(self, config: dict[str, Any]) -> dict[str, Any]:
+        with self._admission_lock:
+            if self._stopping:
+                raise RuntimeError("서버가 종료 중입니다.")
+            if self._isolate_workers and self._processes:
+                raise ActiveJobExistsError(next(iter(self._processes)))
+            return self._create_job(config)
+
+    def _create_job(self, config: dict[str, Any]) -> dict[str, Any]:
         job_id = uuid4().hex
         resume_from_job_id = str(config.get("resume_from_job_id") or "")
         resume = bool(config.get("resume"))
@@ -224,6 +247,9 @@ class JobManager:
             self._worker_launcher(job_id)
             return
         context = multiprocessing.get_context("spawn")
+        if self._isolate_workers:
+            self._launch_isolated(context, job_id)
+            return
         process = context.Process(
             target=run_audit_job_worker,
             args=(str(self.repository.db_path), job_id),
@@ -237,6 +263,48 @@ class JobManager:
             job_id,
             f"작업 프로세스를 시작했습니다. pid={process.pid if process.pid is not None else 'unknown'}",
         )
+        self._start_watcher(job_id, process)
+
+    def _launch_isolated(self, context, job_id: str) -> None:
+        require_process_tracking()
+        parent, child = context.Pipe()
+        token = uuid4().hex
+        process = context.Process(
+            target=run_isolated_audit_job_worker,
+            args=(str(self.repository.db_path), job_id, token, child),
+            name=f"bigkinds-audit-{job_id[:8]}",
+        )
+        try:
+            process.start()
+            child.close()
+            self._processes[job_id] = process
+            if not parent.poll(10.0) or parent.recv() != process.pid:
+                raise RuntimeError("worker session 등록 응답이 없습니다.")
+            self._owners[job_id] = register_worker(process.pid, token)
+            self.repository.record_worker_spawned(job_id, process.pid)
+            parent.send("registered")
+            self.repository.append_log(job_id, f"독립 worker session을 시작했습니다. pid={process.pid}")
+        except BaseException:
+            # Before release there are no descendants; after release ownership is registered.
+            if job_id in self._owners:
+                if self._cleanup_isolated(job_id, process):
+                    self._owners.pop(job_id, None)
+                    self._processes.pop(job_id, None)
+            elif process.pid is not None:
+                process.terminate()
+                process.join(timeout=self.terminate_grace_seconds)
+                if process.is_alive():
+                    process.kill()
+                    process.join(timeout=self.terminate_grace_seconds)
+                if not process.is_alive():
+                    self._processes.pop(job_id, None)
+            raise
+        finally:
+            child.close()
+            parent.close()
+        self._start_watcher(job_id, process)
+
+    def _start_watcher(self, job_id: str, process: multiprocessing.Process) -> None:
         threading.Thread(
             target=self._watch_process,
             args=(job_id, process),
@@ -246,7 +314,12 @@ class JobManager:
 
     def _watch_process(self, job_id: str, process: multiprocessing.Process) -> None:
         process.join()
+        cleaned = not self._isolate_workers
         try:
+            if self._isolate_workers:
+                cleaned = self._cleanup_isolated(job_id, process)
+                if not cleaned:
+                    return
             exit_code = process.exitcode
             job = self.repository.get_job(job_id)
             if not job:
@@ -292,8 +365,29 @@ class JobManager:
                 "error",
             )
         finally:
-            if self._processes.get(job_id) is process:
-                self._processes.pop(job_id, None)
+            with self._admission_lock:
+                if cleaned and self._processes.get(job_id) is process:
+                    self._owners.pop(job_id, None)
+                    self._processes.pop(job_id, None)
+
+    def _cleanup_isolated(self, job_id: str, process: multiprocessing.Process) -> bool:
+        with self._cleanup_lock:
+            if self._processes.get(job_id) is not process:
+                return False
+            owner = self._owners.get(job_id)
+            if owner is None or owner.leader.pid != process.pid:
+                return False
+            try:
+                cleaned = terminate_owned_processes(owner, self.terminate_grace_seconds)
+            except Exception as exc:
+                self.repository.append_log(job_id, f"worker 자손 정리 실패: {sanitize(exc)}", "error")
+                return False
+            if not cleaned:
+                self.repository.append_log(job_id, "worker 자손이 남아 새 작업을 차단합니다.", "error")
+                return False
+            process.join(timeout=self.terminate_grace_seconds)
+            # Keep the admission slot until the watcher records the final worker status.
+            return not process.is_alive()
 
     def _start_cancel_watchdog(
         self, job_id: str, process: multiprocessing.Process
@@ -317,7 +411,8 @@ class JobManager:
         ).start()
 
     def _is_recorded_worker(
-        self, job_id: str, process: multiprocessing.Process, *, require_tracked: bool = True
+        self, job_id: str, process: multiprocessing.Process, *, require_tracked: bool = True,
+        require_cancellation: bool = True,
     ) -> bool:
         if require_tracked and self._processes.get(job_id) is not process:
             return False
@@ -326,13 +421,27 @@ class JobManager:
             job
             and process.pid is not None
             and job["worker_pid"] == process.pid
-            and job["status"] in CANCELLATION_STATUSES
+            and (not require_cancellation or job["status"] in CANCELLATION_STATUSES)
         )
 
     def _enforce_cancel_deadline(
         self, job_id: str, process: multiprocessing.Process
     ) -> None:
         process.join(timeout=self.cancel_grace_seconds)
+        if self._isolate_workers:
+            if self._processes.get(job_id) is not process:
+                return
+            if process.is_alive():
+                if not self._is_recorded_worker(job_id, process, require_cancellation=False):
+                    return
+                if self.repository.acknowledge_cancel(job_id):
+                    self.repository.mark_force_terminating(job_id, process.pid)
+                self.repository.append_log(
+                    job_id, f"종료 제한시간을 초과한 worker와 자손을 정리합니다. pid={process.pid}",
+                    "warning",
+                )
+            self._cleanup_isolated(job_id, process)
+            return
         if not process.is_alive() or not self._is_recorded_worker(job_id, process):
             return
         if not self.repository.acknowledge_cancel(job_id):
@@ -372,7 +481,13 @@ class JobManager:
         return self.repository.get_job(job_id)  # type: ignore[return-value]
 
     def shutdown(self) -> None:
+        with self._admission_lock:
+            self._stopping = True
         for job_id, process in list(self._processes.items()):
+            if self._isolate_workers:
+                self.repository.request_cancel(job_id, requested_by="server_shutdown")
+                self._enforce_cancel_deadline(job_id, process)
+                continue
             if process.is_alive():
                 self.repository.request_cancel(job_id, requested_by="server_shutdown")
                 self._enforce_cancel_deadline(job_id, process)

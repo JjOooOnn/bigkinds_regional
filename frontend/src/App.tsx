@@ -1,7 +1,7 @@
 import { FormEvent, useCallback, useEffect, useMemo, useState } from 'react'
 import packageInfo from '../package.json'
 import { api } from './api'
-import type { AuditJob, JobLog, JobStatus, RegionOption, ResultResponse } from './types'
+import type { AuditJob, JobLog, JobStatus, RegionOption, ResultResponse, RuntimeInfo } from './types'
 
 const CANCELLING = new Set(['cancel_requested', 'cancelling', 'force_terminating'])
 const ACTIVE = new Set(['queued', 'running', ...CANCELLING])
@@ -110,10 +110,12 @@ function EmptyState({ children }: { children: React.ReactNode }) {
 function SetupScreen({
   regions,
   jobs,
+  runtime,
   onCreated,
 }: {
   regions: RegionOption[]
   jobs: AuditJob[]
+  runtime: RuntimeInfo | null
   onCreated: (job: AuditJob) => void
 }) {
   const [startDate, setStartDate] = useState(today())
@@ -134,7 +136,7 @@ function SetupScreen({
   const resumableJobs = jobs.filter(
     (job) => RESUMABLE.has(job.status) && job.manual_resume_available,
   )
-  const canSubmit = Boolean(startDate && endDate && !dateError && !regionError && !submitting)
+  const canSubmit = Boolean(runtime && startDate && endDate && !dateError && !regionError && !submitting)
 
   function toggleRegion(name: string) {
     setSelected((current) => current.includes(name)
@@ -163,7 +165,7 @@ function SetupScreen({
         end_date: endDate,
         all_regions: allRegions,
         regions: allRegions ? [] : selected,
-        headed,
+        headed: Boolean(runtime?.user_headed_allowed && headed),
         resume: resume && Boolean(resumeJobId),
         resume_from_job_id: resume ? resumeJobId || null : null,
       })
@@ -178,7 +180,7 @@ function SetupScreen({
   return (
     <main className="page setup-page">
       <section className="hero">
-        <p className="eyebrow">LOCAL LINK AUDIT</p>
+        <p className="eyebrow">{runtime?.runtime === 'server' ? 'LINK AUDIT' : 'LOCAL LINK AUDIT'}</p>
         <h1>점검을 시작할까요?</h1>
         <p>날짜와 지역을 선택하면 지역이슈의 뉴스 링크가 정상적으로 열리는지 자동으로 확인합니다.</p>
       </section>
@@ -272,11 +274,11 @@ function SetupScreen({
               <strong>백그라운드 실행</strong>
               <small>추천 · 브라우저 창을 띄우지 않아요</small>
             </label>
-            <label className={`mode-option ${headed ? 'selected' : ''}`}>
-              <input type="radio" name="headed" checked={headed} onChange={() => setHeaded(true)} />
+            <label className={`mode-option ${headed ? 'selected' : ''}${runtime?.user_headed_allowed ? '' : ' unavailable'}`}>
+              <input type="radio" name="headed" checked={headed} onChange={() => setHeaded(true)} disabled={!runtime?.user_headed_allowed} />
               <span className="mode-icon" aria-hidden="true">▣</span>
               <strong>브라우저 표시</strong>
-              <small>DOM이나 클릭을 직접 확인할 때 사용해요</small>
+              <small>{runtime?.runtime === 'server' ? '브라우저 표시는 로컬 실행에서 사용할 수 있어요' : 'DOM이나 클릭을 직접 확인할 때 사용해요'}</small>
             </label>
           </div>
 
@@ -541,6 +543,7 @@ function HistoryScreen({ jobs, onOpen, onRefresh }: { jobs: AuditJob[]; onOpen: 
 
 export default function App() {
   const [screen, setScreen] = useState<Screen>('setup')
+  const [runtime, setRuntime] = useState<RuntimeInfo | null>(null)
   const [regions, setRegions] = useState<RegionOption[]>([])
   const [jobs, setJobs] = useState<AuditJob[]>([])
   const [job, setJob] = useState<AuditJob | null>(null)
@@ -592,7 +595,8 @@ export default function App() {
   useEffect(() => {
     async function bootstrap() {
       try {
-        const [regionResponse, jobResponse] = await Promise.all([api.regions(), api.jobs()])
+        const [runtimeResponse, regionResponse, jobResponse] = await Promise.all([api.runtime(), api.regions(), api.jobs()])
+        setRuntime(runtimeResponse)
         setRegions(regionResponse.regions)
         setJobs(jobResponse.jobs)
         const stored = localStorage.getItem(STORAGE_KEY)
@@ -656,14 +660,16 @@ export default function App() {
 
       {globalError && <div className="global-error" role="alert"><span>{globalError}</span><button type="button" onClick={() => setGlobalError('')} aria-label="오류 안내 닫기">×</button></div>}
 
-      {screen === 'setup' && <SetupScreen regions={regions} jobs={jobs} onCreated={(created) => { setJobs((items) => [created, ...items]); openJob(created) }} />}
+      {screen === 'setup' && <SetupScreen regions={regions} jobs={jobs} runtime={runtime} onCreated={(created) => { setJobs((items) => [created, ...items]); openJob(created) }} />}
       {screen === 'history' && <HistoryScreen jobs={jobs} onOpen={openJob} onRefresh={refreshJobs} />}
       {screen === 'job' && job && (ACTIVE.has(job.status)
         ? <ProgressScreen job={job} logs={logs} onCancel={cancelJob} cancelling={cancelling} tick={tick} />
         : <ResultsScreen job={job} results={results} regions={regions} filters={filters} onFilters={setFilters} onApplyFilters={() => void loadResults(job.job_id, filters)} loading={loadingResults} />)}
       {screen === 'job' && !job && <main className="page"><EmptyState>작업 정보를 불러오고 있습니다.</EmptyState></main>}
 
-      <footer>모든 데이터는 이 PC에만 저장됩니다 · 외부 로그인이나 클라우드 저장소를 사용하지 않습니다. · 버전 v{packageInfo.version}</footer>
+      <footer>{runtime?.runtime === 'server'
+        ? '작업 이력과 결과는 서버 저장소에 보관됩니다.'
+        : '모든 데이터는 이 PC에만 저장됩니다 · 외부 로그인이나 클라우드 저장소를 사용하지 않습니다.'} · 버전 v{packageInfo.version}</footer>
     </div>
   )
 }

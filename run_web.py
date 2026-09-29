@@ -14,7 +14,8 @@ from typing import Callable, TextIO
 
 import uvicorn
 
-from src.config import ROOT_DIR, WORK_DIR
+from src.browser_runtime import managed_display
+from src.config import ROOT_DIR, RUNTIME_CONFIG, WORK_DIR, load_runtime_config
 from src.logging_utils import configure_lifecycle_logging, log_lifecycle_event, sanitize
 
 
@@ -98,7 +99,7 @@ def preserve_console_output(log_dir: Path):
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="빅카인즈 링크 점검 로컬 사용자 페이지 실행")
-    parser.add_argument("--port", type=int, default=8000, help="로컬 포트(기본 8000)")
+    parser.add_argument("--port", type=int, help="서비스 포트(로컬 기본 8000, 서버 모드는 PORT 사용)")
     parser.add_argument("--no-browser", action="store_true", help="기본 브라우저를 자동으로 열지 않음")
     parser.add_argument("--skip-build", action="store_true", help="프런트엔드 빌드 확인을 건너뜀")
     return parser
@@ -121,26 +122,46 @@ def ensure_frontend_build() -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    if not 1 <= args.port <= 65535:
+    try:
+        runtime = load_runtime_config()
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+
+    port = args.port if args.port is not None else runtime.port
+    if not 1 <= port <= 65535:
         raise SystemExit("--port는 1부터 65535 사이여야 합니다.")
-    with preserve_console_output(SERVER_LOG_DIR) as server_output:
+    if runtime.is_server and not FRONTEND_INDEX.is_file():
+        raise RuntimeError(
+            "서버 모드에 frontend 빌드가 없습니다. 이미지 빌드 단계에서 frontend/dist를 포함해 주세요."
+        )
+
+    log_dir = (
+        SERVER_LOG_DIR
+        if runtime.data_dir == RUNTIME_CONFIG.data_dir
+        else runtime.data_dir / "work" / "server_logs"
+    )
+    with preserve_console_output(log_dir) as server_output:
         log_path = server_output.current_path
         lifecycle_logger = configure_lifecycle_logging()
         log_lifecycle_event(
             lifecycle_logger, "server_launcher", "starting",
-            pid=os.getpid(), port=args.port, log_path=log_path,
+            pid=os.getpid(), host=runtime.host, port=port, log_path=log_path,
         )
-        if not args.skip_build:
+        if not args.skip_build and runtime.open_browser:
             ensure_frontend_build()
 
-        url = f"http://127.0.0.1:{args.port}"
-        if not args.no_browser:
+        url = f"http://127.0.0.1:{port}"
+        if runtime.open_browser and not args.no_browser:
             threading.Timer(1.0, lambda: webbrowser.open(url)).start()
-        print(f"로컬 사용자 페이지: {url}")
+        if runtime.open_browser:
+            print(f"로컬 사용자 페이지: {url}")
+        else:
+            print(f"서버 바인딩: {runtime.host}:{port}")
         print(f"서버 로그: {log_path}")
         print("종료하려면 이 창에서 Ctrl+C를 누르세요.")
         try:
-            uvicorn.run("src.api.app:app", host="127.0.0.1", port=args.port, workers=1)
+            with managed_display(runtime):
+                uvicorn.run("src.api.app:app", host=runtime.host, port=port, workers=1)
         except BaseException as exc:
             log_lifecycle_event(
                 lifecycle_logger, "server_launcher", "stopped",

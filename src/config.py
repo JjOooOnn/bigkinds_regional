@@ -1,11 +1,81 @@
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Mapping
 
 TARGET_URL = "https://www.bigkinds.or.kr/regional/curation.do"
 ROOT_DIR = Path(__file__).resolve().parent.parent
-OUTPUT_DIR = ROOT_DIR / "output"
-WORK_DIR = ROOT_DIR / "work"
-SCREENSHOT_DIR = ROOT_DIR / "artifacts" / "screenshots"
-TRACE_DIR = ROOT_DIR / "artifacts" / "traces"
+
+
+@dataclass(frozen=True)
+class RuntimeConfig:
+    """Web-server settings with the original local behavior as the default."""
+
+    mode: str
+    host: str
+    port: int
+    data_dir: Path
+
+    @property
+    def is_server(self) -> bool:
+        return self.mode == "server"
+
+    @property
+    def open_browser(self) -> bool:
+        return not self.is_server
+
+    @property
+    def output_dir(self) -> Path:
+        return self.data_dir / "output"
+
+    @property
+    def work_dir(self) -> Path:
+        return self.data_dir / "work"
+
+    @property
+    def screenshot_dir(self) -> Path:
+        return self.data_dir / "artifacts" / "screenshots"
+
+    @property
+    def trace_dir(self) -> Path:
+        return self.data_dir / "artifacts" / "traces"
+
+
+def load_runtime_config(environ: Mapping[str, str] | None = None) -> RuntimeConfig:
+    """Read the small set of settings needed to start the web service."""
+    env = os.environ if environ is None else environ
+    mode = env.get("BIGKINDS_RUNTIME", "local").strip().lower() or "local"
+    if mode not in {"local", "server"}:
+        raise ValueError("BIGKINDS_RUNTIME은 'local' 또는 'server'여야 합니다.")
+
+    if mode == "server":
+        raw_port = env.get("PORT", "8000").strip() or "8000"
+        try:
+            port = int(raw_port)
+        except ValueError as exc:
+            raise ValueError("PORT는 1부터 65535 사이의 정수여야 합니다.") from exc
+        host = "0.0.0.0"
+    else:
+        # PORT is a platform setting; ignore it unless server mode was selected.
+        port = 8000
+        host = "127.0.0.1"
+
+    if not 1 <= port <= 65535:
+        raise ValueError("PORT는 1부터 65535 사이의 정수여야 합니다.")
+
+    configured_data_dir = env.get("BIGKINDS_DATA_DIR", "").strip()
+    data_dir = Path(configured_data_dir) if configured_data_dir else ROOT_DIR
+    return RuntimeConfig(mode=mode, host=host, port=port, data_dir=data_dir)
+
+
+RUNTIME_CONFIG = load_runtime_config()
+DATA_DIR = RUNTIME_CONFIG.data_dir
+OUTPUT_DIR = RUNTIME_CONFIG.output_dir
+WORK_DIR = RUNTIME_CONFIG.work_dir
+SCREENSHOT_DIR = RUNTIME_CONFIG.screenshot_dir
+TRACE_DIR = RUNTIME_CONFIG.trace_dir
 
 RESULT_COLUMNS = [
     "순번", "조회요청일", "화면표시일", "지역명", "이슈순번", "이슈제목", "이슈분류",

@@ -5,6 +5,7 @@ import re
 import time
 from dataclasses import dataclass
 from datetime import date, datetime
+from weakref import WeakKeyDictionary, WeakSet
 
 from playwright.async_api import (
     Browser,
@@ -16,8 +17,9 @@ from playwright.async_api import (
     async_playwright,
 )
 
+from .browser_runtime import chromium_launch_options, is_missing_browser_capability, verification_environments
 from .checkpoint import CheckpointStore, RowUpsertResult, RowUpsertStatus
-from .config import ISSUE_CATEGORIES, SCREENSHOT_DIR, TARGET_URL
+from .config import ISSUE_CATEGORIES, SCREENSHOT_DIR, TARGET_URL, load_runtime_config
 from .date_navigation import DateNavigator, inclusive_dates
 from .link_checker import BrowserLinkChecker, LinkCheckResult
 from .logging_utils import debug_entry, sanitize
@@ -41,10 +43,6 @@ from .application.progress import (
 )
 
 
-AUTOMATION_VERIFICATION_ENVIRONMENTS = (
-    ("번들 Chromium headed", {"headless": False}),
-    ("Microsoft Edge headed", {"headless": False, "channel": "msedge"}),
-)
 CANCEL_POLL_SECONDS = 0.5
 CLEANUP_TIMEOUT_SECONDS = 5.0
 CLEANUP_TOTAL_SECONDS = 10.0
@@ -110,17 +108,20 @@ class RegionalCollector:
         self.normal_count = sum(row.verdict == "정상" for row in existing_rows)
         self.error_count = self.processed_links - self.normal_count
         self.completed_region_units = 0
-        self.status_by_page: dict[Page, int] = {}
+        self.runtime = load_runtime_config()
+        self.status_by_page: WeakKeyDictionary[Page, int] = WeakKeyDictionary()
         self.status_by_url: dict[str, int] = {}
-        self.first_url_by_page: dict[Page, str] = {}
+        self.first_url_by_page: WeakKeyDictionary[Page, str] = WeakKeyDictionary()
         self._playwright: Playwright | None = None
         self._verification_sessions: dict[str, tuple[Browser, BrowserContext]] = {}
+        self._unavailable_verification_environments: set[str] = set()
+        self._closed_verification_contexts: WeakSet[BrowserContext] = WeakSet()
         self._session: _BrowserSession | None = None
-        self._disconnected_browsers: set[Browser] = set()
-        self._crashed_pages: set[Page] = set()
-        self._unexpected_closed_pages: set[Page] = set()
-        self._intentional_page_closes: set[Page] = set()
-        self._intentional_browser_closes: set[Browser] = set()
+        self._disconnected_browsers: WeakSet[Browser] = WeakSet()
+        self._crashed_pages: WeakSet[Page] = WeakSet()
+        self._unexpected_closed_pages: WeakSet[Page] = WeakSet()
+        self._intentional_page_closes: WeakSet[Page] = WeakSet()
+        self._intentional_browser_closes: WeakSet[Browser] = WeakSet()
         self._current_article_key: tuple[str, str, int, int] | None = None
         self._article_browser_failure_signal: asyncio.Future[BrowserSessionFailure] | None = None
         self._article_recovery_counts: dict[tuple[str, str, int, int], int] = {}
@@ -302,7 +303,9 @@ class RegionalCollector:
     async def _create_browser_session(self) -> _BrowserSession:
         if self._playwright is None:
             raise RuntimeError("브라우저 세션에 사용할 Playwright 실행기가 없습니다.")
-        browser = await self._playwright.chromium.launch(headless=not self.headed)
+        browser = await self._playwright.chromium.launch(
+            **chromium_launch_options(headed=self.headed, runtime=self.runtime)
+        )
         self._track_browser_lifecycle(browser)
         self.progress_reporter.emit(
             "browser_started", "Chromium 브라우저가 시작되었습니다.",
@@ -312,14 +315,19 @@ class RegionalCollector:
         context_options: dict[str, object] = {"locale": "ko-KR"}
         if not self.headed:
             context_options["user_agent"] = self._desktop_chromium_user_agent(browser.version)
-        context = await browser.new_context(**context_options)
-        context.set_default_timeout(self.timeout_ms)
-        self._track_navigation(context)
-        page = await context.new_page()
-        self._track_page_lifecycle(page, "BigKinds page")
-        await page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=60_000)
-        await page.wait_for_timeout(4_000)
-        return _BrowserSession(browser=browser, context=context, page=page)
+        context = None
+        try:
+            context = await browser.new_context(**context_options)
+            context.set_default_timeout(self.timeout_ms)
+            self._track_navigation(context)
+            page = await context.new_page()
+            self._track_page_lifecycle(page, "BigKinds page")
+            await page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=60_000)
+            await page.wait_for_timeout(4_000)
+            return _BrowserSession(browser=browser, context=context, page=page)
+        except BaseException:
+            await self._close_context_browser(context, browser, "부분 생성 Chromium")
+            raise
 
     def _track_browser_lifecycle(self, browser: Browser) -> None:
         def on_disconnected(*_args) -> None:
@@ -584,11 +592,21 @@ class RegionalCollector:
     async def _cleanup_browser_resources(
         self, context: BrowserContext, browser: Browser,
     ) -> None:
-        await self._close_verification_sessions()
-        self._intentional_page_closes.update(context.pages)
-        await self._bounded_cleanup(context.close(), "브라우저 컨텍스트")
+        try:
+            await self._close_verification_sessions()
+        finally:
+            await self._close_context_browser(context, browser, "Chromium")
+
+    async def _close_context_browser(
+        self, context: BrowserContext | None, browser: Browser, label: str,
+    ) -> None:
         self._intentional_browser_closes.add(browser)
-        await self._bounded_cleanup(browser.close(), "Chromium 브라우저")
+        try:
+            if context is not None:
+                self._intentional_page_closes.update(context.pages)
+                await self._bounded_cleanup(context.close(), f"{label} 컨텍스트")
+        finally:
+            await self._bounded_cleanup(browser.close(), f"{label} 브라우저")
 
     async def _bounded_cleanup(self, awaitable, label: str) -> bool:
         try:
@@ -613,20 +631,35 @@ class RegionalCollector:
     ) -> BrowserContext:
         existing = self._verification_sessions.get(environment)
         if existing is not None:
-            return existing[1]
+            browser, context = existing
+            if browser.is_connected() and context not in self._closed_verification_contexts:
+                return context
+            self._verification_sessions.pop(environment)
+            await self._close_context_browser(context, browser, environment)
         if self._playwright is None:
             raise RuntimeError("대체 브라우저 검증에 사용할 Playwright 실행기가 없습니다.")
-        browser = await self._playwright.chromium.launch(**launch_options)
-        context = await browser.new_context(locale="ko-KR")
-        context.set_default_timeout(self.timeout_ms)
+        try:
+            browser = await self._playwright.chromium.launch(**launch_options)
+        except Exception as exc:
+            if is_missing_browser_capability(exc):
+                self._unavailable_verification_environments.add(environment)
+            raise
+        context = None
+        try:
+            context = await browser.new_context(locale="ko-KR")
+            context.set_default_timeout(self.timeout_ms)
+            context.on("close", lambda *_: self._closed_verification_contexts.add(context))
+        except BaseException:
+            await self._close_context_browser(context, browser, environment)
+            raise
         self._verification_sessions[environment] = (browser, context)
         return context
 
     async def _close_verification_sessions(self) -> None:
         sessions = list(self._verification_sessions.items())
         self._verification_sessions.clear()
-        for environment, (browser, _) in reversed(sessions):
-            await self._bounded_cleanup(browser.close(), f"{environment} 검증 브라우저")
+        for environment, (browser, context) in reversed(sessions):
+            await self._close_context_browser(context, browser, f"{environment} 검증")
 
     async def _verify_automation_environment_block(
         self, primary: LinkCheckResult, url: str, expected_title: str,
@@ -644,7 +677,10 @@ class RegionalCollector:
             return primary
 
         attempts: list[str] = []
-        for environment, launch_options in AUTOMATION_VERIFICATION_ENVIRONMENTS:
+        for environment, launch_options in verification_environments(self.runtime):
+            if environment in self._unavailable_verification_environments:
+                attempts.append(f"{environment}: 실행 환경 미지원 (이 작업에서 재시도 생략)")
+                continue
             page: Page | None = None
             try:
                 context = await self._verification_context(environment, launch_options)

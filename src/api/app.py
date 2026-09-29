@@ -13,10 +13,11 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from src.application.job_manager import JobManager
 from src.application.job_repository import JobRepository
-from src.config import ROOT_DIR, WORK_DIR
+from src.config import ROOT_DIR, WORK_DIR, load_runtime_config
 from src.logging_utils import log_lifecycle_event, sanitize
 from src.version import read_app_version
 
+from .access_control import ServerAccessMiddleware, load_server_access_settings
 from .routes_jobs import router
 
 
@@ -30,6 +31,8 @@ def create_app(
     job_manager: JobManager | None = None,
     frontend_dist: Path = FRONTEND_DIST,
 ) -> FastAPI:
+    runtime = load_runtime_config()
+    access = load_server_access_settings() if runtime.is_server else None
     owns_manager = job_manager is None
     repository = job_manager.repository if job_manager else JobRepository(db_path)
     manager = job_manager or JobManager(repository, recover_on_start=False)
@@ -71,16 +74,21 @@ def create_app(
     )
     app.state.job_repository = repository
     app.state.job_manager = manager
-    app.add_middleware(
-        TrustedHostMiddleware,
-        allowed_hosts=["127.0.0.1", "localhost", "testserver"],
-    )
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"],
-        allow_methods=["GET", "POST"],
-        allow_headers=["Content-Type"],
-    )
+    app.state.runtime_config = runtime
+    if access is not None:
+        app.add_middleware(ServerAccessMiddleware, password=access.password)
+        app.add_middleware(TrustedHostMiddleware, allowed_hosts=list(access.allowed_hosts))
+    else:
+        app.add_middleware(
+            TrustedHostMiddleware,
+            allowed_hosts=["127.0.0.1", "localhost", "testserver"],
+        )
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"],
+            allow_methods=["GET", "POST"],
+            allow_headers=["Content-Type"],
+        )
     app.include_router(router)
 
     static_assets = frontend_dist / "assets"

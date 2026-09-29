@@ -14,6 +14,11 @@ export interface RegionOption {
   name: string
 }
 
+export interface RuntimeInfo {
+  runtime: 'local' | 'server'
+  user_headed_allowed: boolean
+}
+
 export interface AuditJob {
   job_id: string
   created_at: string

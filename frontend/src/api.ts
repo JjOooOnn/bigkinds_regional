@@ -1,4 +1,4 @@
-import type { AuditJob, JobLog, RegionOption, ResultResponse } from './types'
+import type { AuditJob, JobLog, RegionOption, ResultResponse, RuntimeInfo } from './types'
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
@@ -21,6 +21,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  runtime: () => request<RuntimeInfo>('/api/config/runtime'),
   regions: () => request<{ regions: RegionOption[] }>('/api/config/regions'),
   jobs: () => request<{ jobs: AuditJob[] }>('/api/jobs'),
   job: (jobId: string) => request<AuditJob>(`/api/jobs/${jobId}`),

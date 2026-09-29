@@ -40,6 +40,7 @@ beforeEach(() => {
 describe('점검 설정 화면', () => {
   it('footer에 manifest 버전을 표시한다', async () => {
     vi.spyOn(globalThis, 'fetch').mockImplementation((input) => {
+      if (String(input) === '/api/config/runtime') return json({ runtime: 'local', user_headed_allowed: true })
       if (String(input) === '/api/config/regions') return json({ regions })
       if (String(input) === '/api/jobs') return json({ jobs: [] })
       return json({})
@@ -48,6 +49,65 @@ describe('점검 설정 화면', () => {
     render(<App />)
 
     expect(await screen.findByRole('contentinfo')).toHaveTextContent(`버전 v${packageInfo.version}`)
+  })
+
+  it('서버에서는 브라우저 표시를 막고 서버 저장 안내를 보여준다', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation((input, init) => {
+      const url = String(input)
+      if (url === '/api/config/runtime') return json({ runtime: 'server', user_headed_allowed: false })
+      if (url === '/api/config/regions') return json({ regions })
+      if (url === '/api/jobs' && init?.method === 'POST') return json(baseJob(), 201)
+      if (url === '/api/jobs') return json({ jobs: [] })
+      if (url === '/api/jobs/job-1') return json(baseJob())
+      if (url.endsWith('/logs')) return json({ logs: [] })
+      return json({})
+    })
+
+    render(<App />)
+    expect(await screen.findByText('브라우저 표시는 로컬 실행에서 사용할 수 있어요')).toBeInTheDocument()
+    expect(screen.getByRole('radio', { name: /브라우저 표시/ })).toBeDisabled()
+    expect(screen.getByRole('contentinfo')).toHaveTextContent('서버 저장소에 보관됩니다')
+    fireEvent.click(screen.getByRole('button', { name: '점검 시작' }))
+    await waitFor(() => {
+      const call = fetchMock.mock.calls.find(([url, init]) => url === '/api/jobs' && init?.method === 'POST')
+      expect(call).toBeDefined()
+      expect(JSON.parse(String(call?.[1]?.body)).headed).toBe(false)
+    })
+  })
+
+  it('로컬에서는 브라우저 표시 실행을 계속 선택할 수 있다', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation((input, init) => {
+      const url = String(input)
+      if (url === '/api/config/runtime') return json({ runtime: 'local', user_headed_allowed: true })
+      if (url === '/api/config/regions') return json({ regions })
+      if (url === '/api/jobs' && init?.method === 'POST') return json(baseJob({ headed: true }), 201)
+      if (url === '/api/jobs') return json({ jobs: [] })
+      if (url === '/api/jobs/job-1') return json(baseJob({ headed: true }))
+      if (url.endsWith('/logs')) return json({ logs: [] })
+      return json({})
+    })
+
+    render(<App />)
+    await waitFor(() => expect(screen.getByRole('radio', { name: /브라우저 표시/ })).toBeEnabled())
+    fireEvent.click(screen.getByRole('radio', { name: /브라우저 표시/ }))
+    fireEvent.click(screen.getByRole('button', { name: '점검 시작' }))
+    await waitFor(() => {
+      const call = fetchMock.mock.calls.find(([url, init]) => url === '/api/jobs' && init?.method === 'POST')
+      expect(call).toBeDefined()
+      expect(JSON.parse(String(call?.[1]?.body)).headed).toBe(true)
+    })
+  })
+
+  it('실행 환경을 확인하지 못하면 작업 제출을 막는다', async () => {
+    vi.spyOn(globalThis, 'fetch').mockImplementation((input) => {
+      if (String(input) === '/api/config/runtime') return json({ detail: '환경을 읽을 수 없습니다.' }, 503)
+      if (String(input) === '/api/config/regions') return json({ regions })
+      return json({ jobs: [] })
+    })
+
+    render(<App />)
+    expect(await screen.findByText('환경을 읽을 수 없습니다.')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '점검 시작' })).toBeDisabled()
   })
 
   it('수동 재개가 가능한 실패 작업만 재개 대상으로 표시한다', async () => {
@@ -62,6 +122,7 @@ describe('점검 설정 화면', () => {
       checkpoint_state: 'incomplete',
     })
     vi.spyOn(globalThis, 'fetch').mockImplementation((input) => {
+      if (String(input) === '/api/config/runtime') return json({ runtime: 'local', user_headed_allowed: true })
       if (String(input) === '/api/config/regions') return json({ regions })
       if (String(input) === '/api/jobs') return json({ jobs: [cancelled, resumable] })
       return json({})
@@ -77,6 +138,7 @@ describe('점검 설정 화면', () => {
   it('날짜 오류와 지역 복수 선택을 표시하고 유효할 때 실행한다', async () => {
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation((input, init) => {
       const url = String(input)
+      if (url === '/api/config/runtime') return json({ runtime: 'local', user_headed_allowed: true })
       if (url === '/api/config/regions') return json({ regions })
       if (url === '/api/jobs' && init?.method === 'POST') return json(baseJob(), 201)
       if (url === '/api/jobs') return json({ jobs: [] })
@@ -105,6 +167,7 @@ describe('점검 설정 화면', () => {
 
   it('API 오류를 이해하기 쉬운 문구로 표시한다', async () => {
     vi.spyOn(globalThis, 'fetch').mockImplementation((input, init) => {
+      if (String(input) === '/api/config/runtime') return json({ runtime: 'local', user_headed_allowed: true })
       if (String(input) === '/api/config/regions') return json({ regions })
       if (String(input) === '/api/jobs' && init?.method === 'POST') return json({ detail: '이미 실행 중인 작업이 있습니다.' }, 409)
       return json({ jobs: [] })
@@ -124,6 +187,7 @@ describe('점검 설정 화면', () => {
     const job = baseJob({ status, status_label: statusLabel, ended_at: '2026-07-20T09:01:00+09:00' })
     vi.spyOn(globalThis, 'fetch').mockImplementation((input) => {
       const url = String(input)
+      if (url === '/api/config/runtime') return json({ runtime: 'local', user_headed_allowed: true })
       if (url === '/api/config/regions') return json({ regions })
       if (url === '/api/jobs') return json({ jobs: [job] })
       if (url === '/api/jobs/job-1') return json(job)
@@ -158,6 +222,7 @@ describe('진행과 결과 화면', () => {
     })
     vi.spyOn(globalThis, 'fetch').mockImplementation((input) => {
       const url = String(input)
+      if (url === '/api/config/runtime') return json({ runtime: 'local', user_headed_allowed: true })
       if (url === '/api/config/regions') return json({ regions })
       if (url === '/api/jobs') return json({ jobs: [running] })
       if (url === '/api/jobs/job-1') return json(running)
@@ -181,6 +246,7 @@ describe('진행과 결과 화면', () => {
     })
     vi.spyOn(globalThis, 'fetch').mockImplementation((input) => {
       const url = String(input)
+      if (url === '/api/config/runtime') return json({ runtime: 'local', user_headed_allowed: true })
       if (url === '/api/config/regions') return json({ regions })
       if (url === '/api/jobs') return json({ jobs: [running] })
       if (url === '/api/jobs/job-1') return json(running)
@@ -202,6 +268,7 @@ describe('진행과 결과 화면', () => {
     const cancelling = baseJob({ status, status_label: statusLabel })
     vi.spyOn(globalThis, 'fetch').mockImplementation((input) => {
       const url = String(input)
+      if (url === '/api/config/runtime') return json({ runtime: 'local', user_headed_allowed: true })
       if (url === '/api/config/regions') return json({ regions })
       if (url === '/api/jobs') return json({ jobs: [cancelling] })
       if (url === '/api/jobs/job-1') return json(cancelling)
@@ -227,6 +294,7 @@ describe('진행과 결과 화면', () => {
     }
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation((input) => {
       const url = String(input)
+      if (url === '/api/config/runtime') return json({ runtime: 'local', user_headed_allowed: true })
       if (url === '/api/config/regions') return json({ regions })
       if (url === '/api/jobs') return json({ jobs: [completed] })
       if (url === '/api/jobs/job-1') return json(completed)
@@ -249,6 +317,7 @@ describe('진행과 결과 화면', () => {
     const completed = baseJob({ status: 'completed', status_label: '완료', ended_at: '2026-07-20T09:01:00+09:00' })
     vi.spyOn(globalThis, 'fetch').mockImplementation((input) => {
       const url = String(input)
+      if (url === '/api/config/runtime') return json({ runtime: 'local', user_headed_allowed: true })
       if (url === '/api/config/regions') return json({ regions })
       if (url === '/api/jobs') return json({ jobs: [completed] })
       if (url === '/api/jobs/job-1') return json(completed)

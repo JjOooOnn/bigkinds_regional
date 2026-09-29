@@ -31,11 +31,20 @@ def _job_or_404(request: Request, job_id: str):
 
 @router.get("/health")
 def health(request: Request):
-    active = next(
-        (job for job in _repository(request).list_jobs(20) if job["status"] in ACTIVE_STATUSES),
-        None,
-    )
-    return {"status": "ok", "local_only": True, "active_job_id": active["job_id"] if active else None}
+    runtime = request.app.state.runtime_config
+    jobs = _repository(request).list_jobs(20)
+    active = next((job for job in jobs if job["status"] in ACTIVE_STATUSES), None)
+    return {
+        "status": "ok",
+        "local_only": not runtime.is_server,
+        "active_job_id": active["job_id"] if active and not runtime.is_server else None,
+    }
+
+
+@router.get("/config/runtime")
+def runtime_config(request: Request):
+    runtime = request.app.state.runtime_config
+    return {"runtime": runtime.mode, "user_headed_allowed": not runtime.is_server}
 
 
 @router.get("/config/regions")
@@ -50,6 +59,8 @@ def regions():
 
 @router.post("/jobs", status_code=status.HTTP_201_CREATED)
 def create_job(payload: JobCreateRequest, request: Request):
+    if request.app.state.runtime_config.is_server and payload.headed:
+        raise HTTPException(status_code=422, detail="브라우저 표시 실행은 로컬에서만 사용할 수 있습니다.")
     try:
         return _manager(request).create_job(payload.to_job_config())
     except ActiveJobExistsError as exc:
