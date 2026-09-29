@@ -312,7 +312,7 @@ class RegionalCollector:
             browser_state="running", current_operation="browser_context_create",
             browser_restart_count=self.browser_restart_count,
         )
-        context_options: dict[str, object] = {"locale": "ko-KR"}
+        context_options: dict[str, object] = {"locale": "ko-KR", "timezone_id": "Asia/Seoul"}
         if not self.headed:
             context_options["user_agent"] = self._desktop_chromium_user_agent(browser.version)
         context = None

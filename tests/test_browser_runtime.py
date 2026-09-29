@@ -92,6 +92,8 @@ def test_partial_session_failure_closes_browser(verification):
                 await collector._verification_context("test", {"headless": False})
             else:
                 await collector._create_browser_session()
+        if not verification:
+            assert browser.new_context.await_args.kwargs["timezone_id"] == "Asia/Seoul"
         browser.close.assert_awaited_once()
         assert not collector._verification_sessions
     asyncio.run(check())
